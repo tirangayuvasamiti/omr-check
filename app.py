@@ -19,7 +19,7 @@ EXPECTED_BUBBLES = 240
 ANS_KEY = {
     1: 2, 2: 4, 3: 2, 4: 2, 5: 2, 6: 1, 7: 1, 8: 1, 9: 4, 10: 2,
     11: 1, 12: 1, 13: 4, 14: 1, 15: 2, 16: 1, 17: 4, 18: 2, 19: 2, 20: 3,
-    21: 4, 22: 2, 23: 1, 24: 2, 25: 3, 26: 1, 27: 3, 28: 4, 29: 4, 30: 3,
+    21: 4, 22: 2, 23: 1, 24: 2, 25: 4, 26: 1, 27: 3, 28: 4, 29: 4, 30: 3,
     31: 1, 32: 3, 33: 2, 34: 2, 35: 3, 36: 2, 37: 4, 38: 3, 39: 1, 40: 4,
     41: 2, 42: 1, 43: 4, 44: 3, 45: 2, 46: 3, 47: 1, 48: 1, 49: 1, 50: 1,
     51: 1, 52: 2, 53: 2, 54: 4, 55: 2, 56: 3, 57: 1, 58: 2, 59: 2, 60: 2
@@ -27,40 +27,86 @@ ANS_KEY = {
 
 def process_omr(image_np, debug=False, show_missed=False):
     orig = image_np.copy()
-    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
     
-    # 1. Detect Paper & Perspective Transform
+    # 1. Resize immediately so marker Area calculations are standard
+    orig = imutils.resize(orig, height=1500)
+    gray = cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY)
+    
+    # 2. Hunt for the 4 Black Corner Machine Elements (Fiducials)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 75, 200)
-
-    cnts = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Otsu thresholding specifically designed for high-contrast black marks on white paper
+    _, marker_thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    
+    # Use RETR_LIST to find markers even if there is a border drawn around the page
+    cnts = cv2.findContours(marker_thresh.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     cnts = imutils.grab_contours(cnts)
-    docCnt = None
+    
+    markers = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        (x, y, w, h) = cv2.boundingRect(c)
+        ar = w / float(h)
+        
+        # Filters: Must be a specific size, roughly square/circular, and solid black
+        if 300 < area < 15000 and 0.5 <= ar <= 1.5:
+            hull = cv2.convexHull(c)
+            if cv2.contourArea(hull) > 0:
+                solidity = area / float(cv2.contourArea(hull))
+                if solidity > 0.7:  # > 70% solid fill
+                    M = cv2.moments(c)
+                    if M["m00"] != 0:
+                        cX = int(M["m10"] / M["m00"])
+                        cY = int(M["m01"] / M["m00"])
+                        markers.append((cX, cY))
 
-    if len(cnts) > 0:
-        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
-        for c in cnts:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4:
-                docCnt = approx
-                break
+    # Identify the absolute Top-Left, Top-Right, Bottom-Left, Bottom-Right markers mathematically
+    corner_pts = None
+    if len(markers) >= 4:
+        pts = np.array(markers)
+        s = pts.sum(axis=1)
+        diff = np.diff(pts, axis=1)
+        
+        tl = pts[np.argmin(s)]
+        br = pts[np.argmax(s)]
+        tr = pts[np.argmin(diff)]
+        bl = pts[np.argmax(diff)]
+        
+        corner_pts = np.array([tl, tr, br, bl], dtype="float32")
 
-    if docCnt is not None:
-        paper = four_point_transform(gray, docCnt.reshape(4, 2))
-        color_paper = four_point_transform(orig, docCnt.reshape(4, 2))
+    # 3. Perspective Transform
+    if corner_pts is not None:
+        # Crop strictly using the 4 machine markers
+        paper = four_point_transform(gray, corner_pts)
+        color_paper = four_point_transform(orig, corner_pts)
     else:
-        paper = gray
-        color_paper = orig
+        # FALLBACK: If corners are covered/missing, try detecting the page edges instead
+        edged = cv2.Canny(blurred, 75, 200)
+        cnts = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = imutils.grab_contours(cnts)
+        docCnt = None
+        if len(cnts) > 0:
+            cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+            for c in cnts:
+                peri = cv2.arcLength(c, True)
+                approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+                if len(approx) == 4:
+                    docCnt = approx
+                    break
+        if docCnt is not None:
+            paper = four_point_transform(gray, docCnt.reshape(4, 2))
+            color_paper = four_point_transform(orig, docCnt.reshape(4, 2))
+        else:
+            paper = gray
+            color_paper = orig
 
-    # 2. Thresholding
+    # 4. Bubble Thresholding
     paper = imutils.resize(paper, height=1500)
     color_paper = imutils.resize(color_paper, height=1500)
     
     thresh = cv2.adaptiveThreshold(paper, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                    cv2.THRESH_BINARY_INV, 51, 11)
 
-    # 3. Find Bubbles
+    # 5. Find Bubbles
     cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cnts = imutils.grab_contours(cnts)
     bubbles = []
@@ -81,12 +127,11 @@ def process_omr(image_np, debug=False, show_missed=False):
     cv2.drawContours(debug_img, bubbles, -1, (255, 0, 255), 2)
 
     if len(bubbles) != EXPECTED_BUBBLES:
-        return None, len(bubbles), color_paper, debug_img, "Bubble count mismatch. Ensure the page is well-lit and fully visible."
+        return None, len(bubbles), color_paper, debug_img, "Bubble count mismatch. Ensure all 4 corner marks are visible in the photo."
 
-    # 4. Sorting & Grading
+    # 6. Sorting & Grading
     try:
         bubbles = imutils_contours.sort_contours(bubbles, method="left-to-right")[0]
-        # 3 columns of 80 bubbles each
         cols = [bubbles[0:80], bubbles[80:160], bubbles[160:240]]
         
         results = {"correct": 0, "wrong": 0, "blank": 0, "double": 0}
@@ -106,49 +151,44 @@ def process_omr(image_np, debug=False, show_missed=False):
                     total = cv2.countNonZero(mask)
                     pixel_counts.append((total, j))
                 
-                # Sort by darkest bubble
                 pixel_counts.sort(key=lambda x: x[0], reverse=True)
                 
                 darkest_val, darkest_idx = pixel_counts[0]
                 second_darkest_val = pixel_counts[1][0]
                 
-                # Get correct answer in Normal Format (1-4) and convert to AI Format (0-3)
+                # Fetch Answer Key and Map to 0-3 Index
                 correct_ans = ANS_KEY.get(q_idx)
                 correct_ans_idx = correct_ans - 1 
                 
                 # --- GRADING LOGIC ---
                 if darkest_val < 300: 
-                    # BLANK
                     results["blank"] += 1
                     if show_missed:
                         cv2.drawContours(color_paper, [row[correct_ans_idx]], -1, (255, 0, 0), 2)
                         
                 elif second_darkest_val > (darkest_val * 0.75): 
-                    # DOUBLE BUBBLED
                     results["double"] += 1
                     results["wrong"] += 1
-                    cv2.drawContours(color_paper, [row[darkest_idx], row[pixel_counts[1][1]]], -1, (0, 255, 255), 3) # Yellow
+                    cv2.drawContours(color_paper, [row[darkest_idx], row[pixel_counts[1][1]]], -1, (0, 255, 255), 3)
                     if show_missed:
                         cv2.drawContours(color_paper, [row[correct_ans_idx]], -1, (255, 0, 0), 2)
                         
                 elif darkest_idx == correct_ans_idx:
-                    # CORRECT
                     results["correct"] += 1
-                    cv2.drawContours(color_paper, [row[darkest_idx]], -1, (0, 255, 0), 3) # Green
+                    cv2.drawContours(color_paper, [row[darkest_idx]], -1, (0, 255, 0), 3)
                     
                 else:
-                    # WRONG
                     results["wrong"] += 1
-                    cv2.drawContours(color_paper, [row[darkest_idx]], -1, (0, 0, 255), 3) # Red 
+                    cv2.drawContours(color_paper, [row[darkest_idx]], -1, (0, 0, 255), 3) 
                     if show_missed:
-                        cv2.drawContours(color_paper, [row[correct_ans_idx]], -1, (255, 0, 0), 2) # Blue 
+                        cv2.drawContours(color_paper, [row[correct_ans_idx]], -1, (255, 0, 0), 2)
                 
                 q_idx += 1
 
         return results, len(bubbles), color_paper, debug_img, "Success"
 
     except Exception as e:
-        return None, len(bubbles), color_paper, debug_img, f"Sorting Error: Camera angle might be too crooked. ({str(e)})"
+        return None, len(bubbles), color_paper, debug_img, f"Sorting Error: Image could not be aligned properly. ({str(e)})"
 
 
 # --- UI ---
@@ -160,7 +200,7 @@ with st.sidebar:
     debug_mode = st.toggle("View AI Diagnostics", value=False, help="Shows exactly which bubbles the AI is finding if an error occurs.")
     
     st.markdown("---")
-    st.info("💡 **Tips for perfect scanning:**\n\n1. Lay paper flat on a dark surface.\n2. Avoid harsh shadows or glare.\n3. Hold camera directly overhead.")
+    st.info("💡 **Tips for perfect scanning:**\n\n1. Lay paper flat.\n2. Ensure all **4 Black Corner Marks** are clearly visible in the photo.\n3. Avoid harsh shadows.")
 
 # --- FULL WIDTH TABBED INTERFACE ---
 tab1, tab2 = st.tabs(["📱 Native Mobile Camera (Best for Focus)", "📸 Quick Browser Scanner"])
@@ -182,7 +222,7 @@ if input_file:
     img_np = np.array(img)
     img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     
-    with st.spinner("Analyzing OMR Sheet..."):
+    with st.spinner("Finding Machine Markers & Grading..."):
         output = process_omr(img_np, debug=debug_mode, show_missed=show_missed)
         
         if output[0] is None:
@@ -221,4 +261,3 @@ if input_file:
                 st.warning("🟡 **Double Bubble**")
                 if show_missed:
                     st.info("🔵 **Missed Answer**")
-
