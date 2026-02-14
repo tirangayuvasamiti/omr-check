@@ -8,13 +8,13 @@ import pandas as pd
 from PIL import Image
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Yuva Gyan Enterprise Grader", layout="wide", page_icon="🏅")
+st.set_page_config(page_title="Yuva Gyan Enterprise Grader", layout="wide", page_icon="📝")
 
 # --- RULES & ANSWER KEY ---
 CORRECT_PTS = 3
 WRONG_PTS = 1  # Subtracted
 
-# Format: Question Number (1-60) : Correct Option (1=A, 2=B, 3=C, 4=D)
+# NORMAL FORMAT: Question No: Correct Option (1=A, 2=B, 3=C, 4=D)
 ANS_KEY = {
     1: 2, 2: 4, 3: 2, 4: 2, 5: 2, 6: 1, 7: 1, 8: 1, 9: 4, 10: 2,
     11: 1, 12: 1, 13: 4, 14: 1, 15: 2, 16: 1, 17: 4, 18: 2, 19: 2, 20: 3,
@@ -25,10 +25,10 @@ ANS_KEY = {
 }
 OPTS = {0: "A", 1: "B", 2: "C", 3: "D"}
 
-# --- COLORS (BGR format for OpenCV) ---
-COLOR_GREEN = (0, 200, 0)     # Correct
+# --- BGR COLORS FOR DRAWING ---
+COLOR_GREEN = (0, 220, 0)     # Correct
 COLOR_RED = (0, 0, 255)       # Incorrect
-COLOR_BLUE = (255, 0, 0)      # Missed Correct Answer
+COLOR_BLUE = (255, 0, 0)      # Missed
 COLOR_YELLOW = (0, 255, 255)  # Double Marked
 
 def load_document(uploaded_file):
@@ -45,145 +45,122 @@ def load_document(uploaded_file):
         img = Image.open(uploaded_file).convert('RGB')
         return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-def get_quadrant_fiducials(gray):
-    """NEW LOGIC: Forces the AI to find exactly one marker per quadrant."""
-    h, w = gray.shape
-    cx, cy = w // 2, h // 2
-    
-    # Adaptive threshold specifically for black printed ink
-    thresh = cv2.adaptiveThreshold(cv2.GaussianBlur(gray, (5, 5), 0), 255, 
-                                   cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 15)
-    
-    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Define the 4 geometric quadrants
-    quads = {"TL": [], "TR": [], "BL": [], "BR": []}
-    
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if 50 < area < 20000:
-            x, y, bw, bh = cv2.boundingRect(c)
-            ar = bw / float(bh)
-            if 0.5 <= ar <= 1.5:  # Roughly square/circular
-                M = cv2.moments(c)
-                if M["m00"] > 0:
-                    px = int(M["m10"] / M["m00"])
-                    py = int(M["m01"] / M["m00"])
-                    
-                    # Sort into quadrants
-                    if px < cx and py < cy: quads["TL"].append((area, [px, py]))
-                    elif px >= cx and py < cy: quads["TR"].append((area, [px, py]))
-                    elif px < cx and py >= cy: quads["BL"].append((area, [px, py]))
-                    elif px >= cx and py >= cy: quads["BR"].append((area, [px, py]))
+def get_document_corners(image):
+    """
+    Finds the 4 corners of the paper.
+    If it's a perfect PDF upload with no background, it uses the image corners itself!
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, 75, 200)
 
-    # Grab the largest contour in each quadrant
-    try:
-        tl = sorted(quads["TL"], key=lambda x: x[0], reverse=True)[0][1]
-        tr = sorted(quads["TR"], key=lambda x: x[0], reverse=True)[0][1]
-        bl = sorted(quads["BL"], key=lambda x: x[0], reverse=True)[0][1]
-        br = sorted(quads["BR"], key=lambda x: x[0], reverse=True)[0][1]
-        return np.array([tl, tr, br, bl], dtype="float32")
-    except IndexError:
-        return None  # Failed to find a marker in one or more quadrants
+    cnts = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = imutils.grab_contours(cnts)
+    
+    doc_cnt = None
+    if len(cnts) > 0:
+        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+        for c in cnts:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            # Must have 4 points and take up at least 20% of the image area
+            if len(approx) == 4 and cv2.contourArea(approx) > (image.shape[0] * image.shape[1] * 0.2):
+                doc_cnt = approx
+                break
+
+    # FALLBACK: If we can't find a paper edge (like in a PDF upload), use the corners of the image itself!
+    if doc_cnt is None:
+        h, w = image.shape[:2]
+        corners = np.array([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]], dtype="float32")
+        return corners
+
+    return doc_cnt.reshape(4, 2)
 
 def process_omr_engine(image_np, show_missed=True):
-    # 1. Base Alignment
+    # 1. Base Alignment using the 4 Page Corners
     orig = imutils.resize(image_np, height=1500)
-    gray = cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY)
-    
-    corner_pts = get_quadrant_fiducials(gray)
-    if corner_pts is None:
-        return None, "Error: Could not detect the 4 corner alignment markers. Ensure the page is flat and fully visible."
+    corner_pts = get_document_corners(orig)
 
     # Standardize image to an exact high-res canvas (1200x1600)
-    warped_gray = four_point_transform(gray, corner_pts)
+    warped_gray = four_point_transform(cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY), corner_pts)
     warped_color = four_point_transform(orig, corner_pts)
     warped_gray = cv2.resize(warped_gray, (1200, 1600))
     warped_color = cv2.resize(warped_color, (1200, 1600))
     
-    # Crop out the top header (Name, Roll No, etc.) to isolate questions
+    # 2. Extract Questions Area (Skips the Roll No header automatically)
     ROI_TOP = 350
-    ROI_BOTTOM = 1550
+    ROI_BOTTOM = 1580
     roi_gray = warped_gray[ROI_TOP:ROI_BOTTOM, :]
     
-    # Threshold strictly to find bubble outlines
     thresh = cv2.adaptiveThreshold(roi_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 11)
     cnts, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # 2. Extract strictly 240 Bubbles
+    # 3. Find exactly 240 Bubbles
     bubbles = []
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)
         ar = w / float(h)
-        # Filters to find perfectly sized circular bubbles
+        # Search for circular options
         if 15 <= w <= 55 and 15 <= h <= 55 and 0.6 <= ar <= 1.4:
             # Shift Y coordinate back to match the original 1200x1600 image
             bubbles.append((x, y + ROI_TOP, w, h))
             
+    # Filter Bubbles
     if len(bubbles) > 240:
-        # Sort by circularity to drop any non-bubble noise
         bubbles = sorted(bubbles, key=lambda b: abs(1.0 - (b[2]/float(b[3]))))[:240]
-    elif len(bubbles) < 240:
-        return None, f"Detection Error: Only found {len(bubbles)}/240 bubbles. Ensure the paper is well lit and not blurry."
+    
+    if len(bubbles) != 240:
+        # ALWAYS SHOW THE IMAGE, even on failure, so user can see what went wrong
+        for (bx, by, bw, bh) in bubbles:
+            cv2.rectangle(warped_color, (bx, by), (bx+bw, by+bh), (255, 0, 255), 2)
+        return None, warped_color, None, f"Detection Error: Found {len(bubbles)}/240 bubbles. Please ensure the scan is clear."
 
-    # 3. Dynamic Macro-Sorting (No fixed pixel columns)
-    # Sort all 240 bubbles Left-to-Right
+    # 4. Smart Dynamic Macro-Sorting
+    # Sort all 240 bubbles Left-to-Right to split into the 3 columns
     bubbles = sorted(bubbles, key=lambda b: b[0])
-    
-    # Split cleanly into 3 columns (80 bubbles each)
-    col1 = bubbles[0:80]
-    col2 = bubbles[80:160]
-    col3 = bubbles[160:240]
-    
-    columns = [col1, col2, col3]
+    columns = [bubbles[0:80], bubbles[80:160], bubbles[160:240]]
     
     results = {"correct": 0, "wrong": 0, "blank": 0, "double": 0}
     breakdown_data = []
     q_number = 1
     
-    # 4. Grading Loop
+    # 5. Grading Loop
     for col in columns:
-        # Sort the 80 bubbles in this column Top-to-Bottom
+        # Sort Top-to-Bottom for this column
         col = sorted(col, key=lambda b: b[1])
         
         # Process 4 bubbles at a time (One Question)
         for i in range(0, 80, 4):
-            # Grab the 4 bubbles and ensure they are sorted Left-to-Right (A, B, C, D)
+            # Sort the 4 bubbles Left-to-Right (A, B, C, D)
             row = sorted(col[i:i+4], key=lambda b: b[0])
             
             fill_data = []
             for j, (bx, by, bw, bh) in enumerate(row):
-                # Isolate the exact core of the bubble on the raw grayscale image
+                # Isolate the core 35% of the bubble to ignore outlines
                 roi = warped_gray[by:by+bh, bx:bx+bw]
                 mask = np.zeros(roi.shape, dtype="uint8")
                 cv2.circle(mask, (bw//2, bh//2), int(min(bw, bh) * 0.35), 255, -1)
                 
-                # Calculate darkness (0 = Black, 255 = White)
-                mean_intensity = cv2.mean(roi, mask=mask)[0]
+                mean_intensity = cv2.mean(roi, mask=mask)[0] # 0 = Black, 255 = White
                 fill_data.append((mean_intensity, j, (bx, by, bw, bh)))
 
-            # Sort by darkest value (lowest number)
             fill_data.sort(key=lambda x: x[0])
-            
             darkest_val = fill_data[0][0]
             lightest_val = fill_data[-1][0]
             
-            # Determine which bubbles are actually filled by the student
+            # Determine marked bubbles based on contrast ratio
             marked_indices = []
             marked_boxes = []
             
             for data in fill_data:
                 intensity, idx, box = data
-                # Dynamic Threshold: If an option is significantly darker than the empty paper, it's marked
-                # Formula: It must be at least 20% darker than the lightest bubble in the row
-                if intensity < (lightest_val * 0.80):
+                # It must be substantially darker than the blank paper to count
+                if intensity < (lightest_val * 0.82):
                     marked_indices.append(idx)
                     marked_boxes.append(box)
 
-            # Get Correct Answer (Convert 1-4 to 0-3 index)
             correct_ans_ai = ANS_KEY.get(q_number) - 1 
             
-            # Helper to draw boxes
             def draw_box(b_box, color, thickness=3):
                 cv2.rectangle(warped_color, (b_box[0], b_box[1]), (b_box[0]+b_box[2], b_box[1]+b_box[3]), color, thickness)
 
@@ -218,12 +195,13 @@ def process_omr_engine(image_np, show_missed=True):
                     # 3. CORRECT
                     results["correct"] += 1
                     status = "Correct"
-                    draw_box(student_box, COLOR_GREEN, 3) # STRICTLY ONLY GREEN
+                    draw_box(student_box, COLOR_GREEN, 3) 
+                    # Note: No blue box will ever be drawn here
                 else:
                     # 4. INCORRECT
                     results["wrong"] += 1
                     status = "Incorrect"
-                    draw_box(student_box, COLOR_RED, 3) # STRICTLY ONLY RED
+                    draw_box(student_box, COLOR_RED, 3) 
                     if show_missed:
                         draw_box(row[correct_ans_ai], COLOR_BLUE, 2)
             
@@ -240,15 +218,15 @@ def process_omr_engine(image_np, show_missed=True):
 
 
 # --- STREAMLIT UI ---
-st.title("🏅 Yuva Gyan Enterprise Grader")
-st.markdown("Fully Autonomous. Mutually Exclusive Logic. Zero Hardcoding.")
+st.title("🏆 Yuva Gyan Enterprise Grader")
+st.markdown("Fully Automated OMR Pipeline for 60 Questions.")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
     show_missed = st.toggle("Show Missed Answers (Blue)", value=True, help="Draws a blue box on the correct answer if the student was wrong or left it blank.")
     
     st.divider()
-    st.info("💡 **How it works:**\n1. Upload a PDF or Image.\n2. The AI natively finds the 4 corner marks.\n3. It isolates all 240 bubbles dynamically without sliders.\n4. It evaluates purely on mathematical grayscale thresholding.")
+    st.info("💡 **How it works:**\n1. Upload a PDF or Image.\n2. The AI natively uses the 4 page corners to flatten the document.\n3. It isolates all 240 bubbles automatically.\n4. Evaluates via Mutually Exclusive logic.")
 
 uploaded_file = st.file_uploader("Upload OMR Document (PDF, JPG, PNG)", type=['pdf', 'jpg', 'png', 'jpeg'])
 
@@ -258,10 +236,15 @@ if uploaded_file:
             img_np = load_document(uploaded_file)
             output = process_omr_engine(img_np, show_missed=show_missed)
             
-            if output[0] is None:
-                st.error(f"⚠️ **Engine Failure:** {output[1]}")
+            # Unpack the safe output (which always contains the image now)
+            data, processed_img, breakdown, msg = output
+            
+            if data is None:
+                st.error(f"⚠️ **{msg}**")
+                st.write("### 🔍 AI Diagnostic View")
+                st.write("The purple boxes below show what the AI *thought* were bubbles. If there aren't exactly 240, check the image quality.")
+                st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), use_container_width=True)
             else:
-                data, processed_img, breakdown, _ = output
                 pos = data['correct'] * CORRECT_PTS
                 neg = data['wrong'] * WRONG_PTS
                 total = pos - neg
