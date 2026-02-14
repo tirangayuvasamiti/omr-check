@@ -25,79 +25,85 @@ ANS_KEY = {
     51: 1, 52: 2, 53: 2, 54: 4, 55: 2, 56: 3, 57: 1, 58: 2, 59: 2, 60: 2
 }
 
-def process_omr(image_np, debug=False, show_missed=False):
-    orig = image_np.copy()
+def get_warp_points(gray, mode):
+    """Finds the 4 anchor points of the document using the chosen method."""
     
-    # 1. Resize immediately so marker Area calculations are standard
-    orig = imutils.resize(orig, height=1500)
-    gray = cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY)
-    
-    # 2. Hunt for the 4 Black Corner Machine Elements (Fiducials)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    # Otsu thresholding specifically designed for high-contrast black marks on white paper
-    _, marker_thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-    
-    # Use RETR_LIST to find markers even if there is a border drawn around the page
-    cnts = cv2.findContours(marker_thresh.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = imutils.grab_contours(cnts)
-    
-    markers = []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        (x, y, w, h) = cv2.boundingRect(c)
-        ar = w / float(h)
-        
-        # Filters: Must be a specific size, roughly square/circular, and solid black
-        if 300 < area < 15000 and 0.5 <= ar <= 1.5:
-            hull = cv2.convexHull(c)
-            if cv2.contourArea(hull) > 0:
-                solidity = area / float(cv2.contourArea(hull))
-                if solidity > 0.7:  # > 70% solid fill
-                    M = cv2.moments(c)
-                    if M["m00"] != 0:
-                        cX = int(M["m10"] / M["m00"])
-                        cY = int(M["m01"] / M["m00"])
-                        markers.append((cX, cY))
-
-    # Identify the absolute Top-Left, Top-Right, Bottom-Left, Bottom-Right markers mathematically
-    corner_pts = None
-    if len(markers) >= 4:
-        pts = np.array(markers)
-        s = pts.sum(axis=1)
-        diff = np.diff(pts, axis=1)
-        
-        tl = pts[np.argmin(s)]
-        br = pts[np.argmax(s)]
-        tr = pts[np.argmin(diff)]
-        bl = pts[np.argmax(diff)]
-        
-        corner_pts = np.array([tl, tr, br, bl], dtype="float32")
-
-    # 3. Perspective Transform
-    if corner_pts is not None:
-        # Crop strictly using the 4 machine markers
-        paper = four_point_transform(gray, corner_pts)
-        color_paper = four_point_transform(orig, corner_pts)
-    else:
-        # FALLBACK: If corners are covered/missing, try detecting the page edges instead
+    # METHOD 1: Page Edges (Standard)
+    def scan_page_edges():
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edged = cv2.Canny(blurred, 75, 200)
         cnts = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts = imutils.grab_contours(cnts)
-        docCnt = None
         if len(cnts) > 0:
             cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
             for c in cnts:
                 peri = cv2.arcLength(c, True)
                 approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-                if len(approx) == 4:
-                    docCnt = approx
-                    break
-        if docCnt is not None:
-            paper = four_point_transform(gray, docCnt.reshape(4, 2))
-            color_paper = four_point_transform(orig, docCnt.reshape(4, 2))
-        else:
-            paper = gray
-            color_paper = orig
+                # Must be 4 points and reasonably large
+                if len(approx) == 4 and cv2.contourArea(approx) > 50000:
+                    return approx.reshape(4, 2)
+        return None
+
+    # METHOD 2: Corner Marks (Fiducials)
+    def scan_corner_marks():
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 11)
+        cnts = cv2.findContours(thresh.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = imutils.grab_contours(cnts)
+        markers = []
+        for c in cnts:
+            area = cv2.contourArea(c)
+            (x, y, w, h) = cv2.boundingRect(c)
+            ar = w / float(h)
+            if 100 < area < 15000 and 0.5 <= ar <= 1.5:
+                hull = cv2.convexHull(c)
+                if cv2.contourArea(hull) > 0:
+                    solidity = area / float(cv2.contourArea(hull))
+                    if solidity > 0.6:  # Mostly solid shape
+                        M = cv2.moments(c)
+                        if M["m00"] != 0:
+                            markers.append([int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])])
+        
+        if len(markers) >= 4:
+            pts = np.array(markers)
+            s = pts.sum(axis=1)
+            diff = np.diff(pts, axis=1)
+            tl = pts[np.argmin(s)]
+            br = pts[np.argmax(s)]
+            tr = pts[np.argmin(diff)]
+            bl = pts[np.argmax(diff)]
+            return np.array([tl, tr, br, bl], dtype="float32")
+        return None
+
+    # Logic based on user selection
+    if mode == "Page Edges (Standard)":
+        return scan_page_edges()
+    elif mode == "Corner Marks (Fiducials)":
+        return scan_corner_marks()
+    else:  # Auto (Try Edges first, then Marks)
+        pts = scan_page_edges()
+        if pts is None:
+            pts = scan_corner_marks()
+        return pts
+
+def process_omr(image_np, align_mode, debug=False, show_missed=False):
+    orig = image_np.copy()
+    
+    # 1. Resize for standard math
+    orig = imutils.resize(orig, height=1500)
+    gray = cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY)
+    
+    # 2. Get the anchor points using chosen method
+    anchor_pts = get_warp_points(gray, align_mode)
+
+    # 3. Perspective Transform
+    if anchor_pts is not None:
+        paper = four_point_transform(gray, anchor_pts)
+        color_paper = four_point_transform(orig, anchor_pts)
+    else:
+        # Fallback if both methods completely fail
+        paper = gray
+        color_paper = orig
 
     # 4. Bubble Thresholding
     paper = imutils.resize(paper, height=1500)
@@ -114,7 +120,8 @@ def process_omr(image_np, debug=False, show_missed=False):
     for c in cnts:
         (x, y, w, h) = cv2.boundingRect(c)
         ar = w / float(h)
-        if 18 <= w <= 55 and 18 <= h <= 55 and 0.7 <= ar <= 1.3:
+        # Widened constraints to catch bubbles even if warp is imperfect
+        if 15 <= w <= 60 and 15 <= h <= 60 and 0.6 <= ar <= 1.4:
             bubbles.append(c)
 
     # Noise filter: Keep only the 240 most perfectly circular bubbles
@@ -127,7 +134,7 @@ def process_omr(image_np, debug=False, show_missed=False):
     cv2.drawContours(debug_img, bubbles, -1, (255, 0, 255), 2)
 
     if len(bubbles) != EXPECTED_BUBBLES:
-        return None, len(bubbles), color_paper, debug_img, "Bubble count mismatch. Ensure all 4 corner marks are visible in the photo."
+        return None, len(bubbles), color_paper, debug_img, f"Bubble count mismatch. Alignment Mode used: '{align_mode}'."
 
     # 6. Sorting & Grading
     try:
@@ -156,7 +163,6 @@ def process_omr(image_np, debug=False, show_missed=False):
                 darkest_val, darkest_idx = pixel_counts[0]
                 second_darkest_val = pixel_counts[1][0]
                 
-                # Fetch Answer Key and Map to 0-3 Index
                 correct_ans = ANS_KEY.get(q_idx)
                 correct_ans_idx = correct_ans - 1 
                 
@@ -195,19 +201,25 @@ def process_omr(image_np, debug=False, show_missed=False):
 st.title("📝 Yuva Gyan Mahotsav OMR Grader")
 
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("⚙️ Scanner Controls")
+    
+    # NEW FEATURE: Let the user choose the alignment method!
+    align_mode = st.radio(
+        "Alignment Method (If it fails, try a different one):",
+        ["Auto (Try Both)", "Page Edges (Standard)", "Corner Marks (Fiducials)"]
+    )
+    
+    st.divider()
+    st.header("⚙️ Display Settings")
     show_missed = st.toggle("Show Missed Answers (Blue)", value=False, help="Draws a blue circle to show the right answer on mistakes.")
     debug_mode = st.toggle("View AI Diagnostics", value=False, help="Shows exactly which bubbles the AI is finding if an error occurs.")
-    
-    st.markdown("---")
-    st.info("💡 **Tips for perfect scanning:**\n\n1. Lay paper flat.\n2. Ensure all **4 Black Corner Marks** are clearly visible in the photo.\n3. Avoid harsh shadows.")
 
 # --- FULL WIDTH TABBED INTERFACE ---
 tab1, tab2 = st.tabs(["📱 Native Mobile Camera (Best for Focus)", "📸 Quick Browser Scanner"])
 
 with tab1:
     st.write("### 📸 High-Quality Capture")
-    st.success("💡 **Tip for Mobile:** Tap **Browse files** below. Your phone will let you use your native Camera app so you can **tap-to-focus** and use the **flash** before grading!")
+    st.success("💡 **Tip for Mobile:** Tap **Browse files** below to use your native Camera app (enables **tap-to-focus** and **flash**).")
     upload_img = st.file_uploader("Take Photo or Upload Image", type=['jpg','png','jpeg'])
 
 with tab2:
@@ -222,15 +234,15 @@ if input_file:
     img_np = np.array(img)
     img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     
-    with st.spinner("Finding Machine Markers & Grading..."):
-        output = process_omr(img_np, debug=debug_mode, show_missed=show_missed)
+    with st.spinner("Analyzing OMR Sheet..."):
+        output = process_omr(img_np, align_mode=align_mode, debug=debug_mode, show_missed=show_missed)
         
         if output[0] is None:
             data, count, processed_img, debug_img, status_msg = output
             st.error(f"⚠️ **Evaluation Failed:** Found {count}/{EXPECTED_BUBBLES} bubbles. {status_msg}")
+            st.info("💡 **Fix it:** Look at the sidebar on the left and change the **Alignment Method** to something else, then try again.")
             
             st.markdown("### 🔍 Diagnostic View (What the AI Sees)")
-            st.write("Ensure there are exactly 240 purple circles perfectly aligned on the bubbles below. If not, adjust lighting or angle.")
             st.image(cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB), use_container_width=True)
             
         else:
