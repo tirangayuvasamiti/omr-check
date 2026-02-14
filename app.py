@@ -23,7 +23,13 @@ ANS_KEY = {
     41: 2, 42: 1, 43: 4, 44: 3, 45: 2, 46: 3, 47: 1, 48: 1, 49: 1, 50: 1,
     51: 1, 52: 2, 53: 2, 54: 4, 55: 2, 56: 3, 57: 1, 58: 2, 59: 2, 60: 2
 }
-OPTS = {0: "A", 1: "B", 2: "C", 3: "D", -1: "BLANK", -2: "DOUBLE"}
+OPTS = {0: "A", 1: "B", 2: "C", 3: "D"}
+
+# BGR Colors for OpenCV
+COLOR_GREEN = (0, 255, 0)
+COLOR_RED = (0, 0, 255)
+COLOR_BLUE = (255, 0, 0)
+COLOR_YELLOW = (0, 255, 255)
 
 def load_file_as_image(uploaded_file):
     if uploaded_file.name.lower().endswith('.pdf'):
@@ -73,14 +79,14 @@ def process_omr_enterprise(image_np, show_missed=False, crop_top=350, crop_botto
     
     corner_pts = find_fiducials(gray)
     if corner_pts is None:
-        return None, "Could not locate the 4 dark corner marks. Ensure the page is not cut off."
+        return None, "Could not locate the 4 dark corner marks. Ensure the page is fully visible."
 
     warped_gray = four_point_transform(gray, corner_pts)
     warped_color = four_point_transform(orig, corner_pts)
     warped_gray = cv2.resize(warped_gray, (1200, 1600))
     warped_color = cv2.resize(warped_color, (1200, 1600))
     
-    # Threshold strictly used for finding bubble borders, NOT for grading
+    # Threshold strictly used for finding bubble outlines
     thresh = cv2.adaptiveThreshold(warped_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 11)
 
     slices = [
@@ -89,10 +95,8 @@ def process_omr_enterprise(image_np, show_missed=False, crop_top=350, crop_botto
         {"x_start": 800, "x_end": 1200, "q_start": 41, "q_end": 60}
     ]
     
-    results = {"correct": 0, "wrong": 0, "blank": 0, "double": 0, "flagged": 0}
+    results = {"correct": 0, "wrong": 0, "blank": 0, "double": 0}
     breakdown_data = [] 
-    debug_img = warped_color.copy()
-    cv2.rectangle(debug_img, (0, crop_top), (1200, crop_bottom), (0, 255, 0), 4)
     
     for s_idx, sl in enumerate(slices):
         slice_thresh = thresh[crop_top:crop_bottom, sl["x_start"]:sl["x_end"]]
@@ -102,117 +106,112 @@ def process_omr_enterprise(image_np, show_missed=False, crop_top=350, crop_botto
         for c in cnts:
             x, y, w, h = cv2.boundingRect(c)
             ar = w / float(h)
-            if 15 <= w <= 55 and 15 <= h <= 55 and 0.6 <= ar <= 1.4:
+            # Generous bounding box to catch all bubbles perfectly
+            if 12 <= w <= 65 and 12 <= h <= 65 and 0.5 <= ar <= 1.5:
                 bubbles.append((x + sl["x_start"], y + crop_top, w, h))
                 
-        if len(bubbles) > 80:
-            bubbles = sorted(bubbles, key=lambda b: abs(1.0 - (b[2]/float(b[3]))))[:80]
-        elif len(bubbles) < 80:
-            return None, f"Found {len(bubbles)}/80 bubbles in Column {s_idx + 1}. Adjust Top/Bottom Crop boundaries."
-
-        # Advanced Row Clustering (Fixes skewed rows)
+        # Group bubbles into strict rows based on Y-coordinates
         bubbles = sorted(bubbles, key=lambda b: b[1])
+        if len(bubbles) == 0:
+            return None, f"No bubbles found in Column {s_idx + 1}. Check crop sliders."
+            
         rows = []
         current_row = [bubbles[0]]
         for b in bubbles[1:]:
-            if abs(b[1] - current_row[-1][1]) < 15: # If Y-coords are within 15 pixels, it's the same row
+            if abs(b[1] - current_row[-1][1]) < 20: # Belongs to same row
                 current_row.append(b)
             else:
                 rows.append(sorted(current_row, key=lambda x: x[0]))
                 current_row = [b]
         rows.append(sorted(current_row, key=lambda x: x[0]))
 
+        # Filter strictly to rows containing exactly 4 options
+        valid_rows = [r for r in rows if len(r) == 4]
+        
+        if len(valid_rows) != 20:
+            return None, f"Found {len(valid_rows)}/20 complete questions in Column {s_idx + 1}. Please adjust Top/Bottom Crop sliders."
+
         current_q = sl["q_start"]
         
-        for row in rows:
-            if len(row) != 4: continue # Skip misidentified rows safely
-            
+        for row in valid_rows:
             intensities = []
             for j, (bx, by, bw, bh) in enumerate(row):
-                # THE 200% ACCURACY UPGRADE: Grayscale Intensity Grading
+                # 200% Accuracy: Check Inner Core Grayscale Darkness
                 roi = warped_gray[by:by+bh, bx:bx+bw]
                 mask = np.zeros(roi.shape, dtype="uint8")
-                # Inner Core Mask (35%)
                 cv2.circle(mask, (bw//2, bh//2), int(min(bw, bh) * 0.35), 255, -1)
                 
-                # Calculate the raw mean darkness (0 = Pure Black, 255 = Pure White)
+                # Mean intensity: 0 is Pure Black (Filled), 255 is Pure White (Empty)
                 mean_intensity = cv2.mean(roi, mask=mask)[0]
                 intensities.append((mean_intensity, j, (bx, by, bw, bh)))
-                
-                cv2.circle(debug_img, (int(bx + bw/2), int(by + bh/2)), int(min(bw, bh) * 0.35), (255, 0, 255), 1)
 
-            # Sort by lowest intensity (Darkest is first)
+            # Sort by darkest value first (lowest number)
             intensities.sort(key=lambda x: x[0])
             darkest_val, darkest_idx, darkest_box = intensities[0]
-            second_darkest_val, second_darkest_idx, second_darkest_box = intensities[1]
+            second_val, second_idx, second_box = intensities[1]
             lightest_val = intensities[-1][0]
             
-            # Mathematical Contrast Engine
-            contrast_ratio = darkest_val / lightest_val if lightest_val > 0 else 1.0
-            confidence = min(100, max(0, int((1.0 - contrast_ratio) * 100 * 1.5))) # Scales nicely to 0-100%
+            # Grayscale Contrast Ratio
+            ratio_1 = darkest_val / lightest_val if lightest_val > 0 else 1.0
+            ratio_2 = second_val / lightest_val if lightest_val > 0 else 1.0
             
-            correct_ans_human = ANS_KEY.get(current_q)
-            correct_ans_ai = correct_ans_human - 1 
+            correct_ans_ai = ANS_KEY.get(current_q) - 1 
             
             def draw_box(b_box, color, thickness=3):
                 cv2.rectangle(warped_color, (b_box[0], b_box[1]), (b_box[0]+b_box[2], b_box[1]+b_box[3]), color, thickness)
 
             status = ""
             selected_human = OPTS[darkest_idx]
-            needs_review = False
 
-            # Grading Logic based on Relative Contrast
-            if contrast_ratio > 0.85: 
-                # Darkest bubble is almost identical to the lightest bubble = BLANK
+            # --- MUTUALLY EXCLUSIVE DRAWING LOGIC ---
+            if ratio_1 > 0.82: 
+                # Blank (Darkest bubble is almost as bright as the lightest)
                 results["blank"] += 1
                 status = "Blank"
                 selected_human = "-"
-                confidence = 100 # We are confident it's blank
-                if show_missed: draw_box(row[correct_ans_ai][0:4], (255, 0, 0), 2)
+                if show_missed:
+                    draw_box(row[correct_ans_ai], COLOR_BLUE)
                     
-            elif second_darkest_val < (darkest_val + 30): 
-                # The second darkest is very close in darkness to the first = DOUBLE BUBBLE
+            elif ratio_2 < 0.85 and (ratio_2 - ratio_1) < 0.12: 
+                # Double Marked (Both bubbles are dark, and very close in darkness)
                 results["double"] += 1
                 results["wrong"] += 1
                 status = "Double Marked"
                 selected_human = "Multiple"
-                confidence = 100
-                draw_box(darkest_box, (0, 255, 255))
-                draw_box(second_darkest_box, (0, 255, 255))
-                if show_missed: draw_box(row[correct_ans_ai][0:4], (255, 0, 0), 2)
+                draw_box(darkest_box, COLOR_YELLOW)
+                draw_box(second_box, COLOR_YELLOW)
+                # Only draw blue if the correct answer wasn't one of the yellow ones
+                if show_missed and correct_ans_ai not in [darkest_idx, second_idx]:
+                    draw_box(row[correct_ans_ai], COLOR_BLUE)
                     
             elif darkest_idx == correct_ans_ai:
+                # Correct Answer
                 results["correct"] += 1
                 status = "Correct"
-                draw_box(darkest_box, (0, 255, 0))
-                if confidence < 40: needs_review = True
+                draw_box(darkest_box, COLOR_GREEN) # ONLY Green is drawn here
                 
             else:
+                # Incorrect Answer
                 results["wrong"] += 1
                 status = "Incorrect"
-                draw_box(darkest_box, (0, 0, 255)) 
-                if show_missed: draw_box(row[correct_ans_ai][0:4], (255, 0, 0), 2)
-                if confidence < 40: needs_review = True
+                draw_box(darkest_box, COLOR_RED) 
+                if show_missed:
+                    draw_box(row[correct_ans_ai], COLOR_BLUE) 
             
-            if needs_review:
-                results["flagged"] += 1
-                status = f"⚠️ {status} (Review)"
-
             breakdown_data.append({
                 "Q No.": current_q,
                 "Selected": selected_human,
-                "Correct Answer": OPTS[correct_ans_ai],
-                "Status": status,
-                "AI Confidence": f"{confidence}%"
+                "Correct": OPTS[correct_ans_ai],
+                "Status": status
             })
             
             current_q += 1
 
-    return results, warped_color, debug_img, breakdown_data, "Success"
+    return results, warped_color, breakdown_data, "Success"
 
 # --- UI ---
 st.title("🚀 Yuva Gyan Enterprise Grader")
-st.markdown("Powered by Grayscale Contrast Engine & AI Confidence Scoring.")
+st.markdown("Powered by Grayscale Contrast Engine & Strict Row Alignment.")
 
 with st.sidebar:
     st.header("⚙️ Target Area Settings")
@@ -222,8 +221,7 @@ with st.sidebar:
     
     st.divider()
     st.header("⚙️ Output Settings")
-    show_missed = st.toggle("Show Missed Answers (Blue)", value=True)
-    show_diagnostics = st.toggle("Show AI Diagnostics Map", value=False)
+    show_missed = st.toggle("Show Missed Answers (Blue)", value=True, help="Draws blue on correct answers if student was wrong.")
 
 uploaded_file = st.file_uploader("Upload Scanned OMR Sheet (PDF or Image)", type=['pdf', 'jpg', 'png', 'jpeg'])
 
@@ -237,7 +235,7 @@ if uploaded_file:
                 st.error(f"⚠️ **Scan Failed:** {output[1]}")
                 st.info("Try adjusting the Crop Sliders on the left menu.")
             else:
-                data, processed_img, debug_img, breakdown, _ = output
+                data, processed_img, breakdown, _ = output
                 pos = data['correct'] * CORRECT_PTS
                 neg = data['wrong'] * WRONG_PTS
                 total = pos - neg
@@ -248,49 +246,46 @@ if uploaded_file:
                 m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Correct", data['correct'], f"+{pos} pts")
                 m2.metric("Incorrect", data['wrong'], f"-{neg} pts")
-                m3.metric("Blank / Double", data['blank'] + data['double'])
-                
-                # Highlight flagged reviews in red if they exist
-                if data['flagged'] > 0:
-                    m4.metric("⚠️ Needs Review", data['flagged'], delta_color="inverse")
-                else:
-                    m4.metric("Needs Review", 0, "All Clear")
-                    
+                m3.metric("Blank", data['blank'])
+                m4.metric("Double Marked", data['double'], help="Counts as incorrect")
                 m5.metric("FINAL SCORE", total)
                 st.progress(acc_percent / 100, text=f"Overall Accuracy: {acc_percent:.1f}%")
                 st.markdown("---")
                 
                 # --- TABBED LAYOUT ---
-                tab1, tab2, tab3 = st.tabs(["📝 Graded Sheet", "📈 Detailed Analytics", "⚙️ Raw Data & Export"])
+                tab1, tab2, tab3 = st.tabs(["📝 Graded Sheet", "📈 Analytics", "⚙️ Raw Data & Export"])
                 
                 with tab1:
                     col_img, col_leg = st.columns([3, 1])
                     with col_img:
                         st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), use_container_width=True)
-                        if show_diagnostics:
-                            st.write("#### 🔍 AI Diagnostics Map")
-                            st.image(cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB), use_container_width=True)
                     with col_leg:
-                        st.info("🟢 Correct\n\n🔴 Incorrect\n\n🔵 Missed\n\n🟡 Double Mark")
+                        st.write("### Legend")
+                        st.info("🟢 Correct\n\n🔴 Incorrect\n\n🔵 Missed Answer\n\n🟡 Double Mark")
                         
                 with tab2:
                     st.write("#### Performance Analytics")
                     chart_data = pd.DataFrame({
-                        "Category": ["Correct", "Incorrect", "Unattempted (Blank)"],
-                        "Count": [data['correct'], data['wrong'], data['blank']]
+                        "Category": ["Correct", "Incorrect", "Blank/Double"],
+                        "Count": [data['correct'], data['wrong'], data['blank'] + data['double']]
                     })
-                    st.bar_chart(chart_data, x="Category", y="Count", color="#4CAF50")
+                    st.bar_chart(chart_data, x="Category", y="Count", color="#0099ff")
                     
                 with tab3:
                     df = pd.DataFrame(breakdown)
+                    # Force 'Q No.' to be a string so it displays cleanly without commas
+                    df['Q No.'] = df['Q No.'].astype(str)
+                    
                     def color_status(val):
-                        if 'Correct' in val: return 'color: #28a745; font-weight: bold;'
-                        if 'Incorrect' in val: return 'color: #dc3545; font-weight: bold;'
-                        if '⚠️' in val: return 'background-color: #ffcccc; color: #dc3545; font-weight: bold;'
+                        if val == 'Correct': return 'color: #28a745; font-weight: bold;'
+                        if val == 'Incorrect': return 'color: #dc3545; font-weight: bold;'
+                        if val == 'Double Marked': return 'color: #ffc107; font-weight: bold;'
                         return 'color: gray;'
                         
                     styled_df = df.style.map(color_status, subset=['Status'])
-                    st.dataframe(styled_df, height=600, use_container_width=True)
+                    
+                    # hide_index=True instantly removes the "0, 1, 2" column on the left!
+                    st.dataframe(styled_df, hide_index=True, use_container_width=True, height=600)
                     
                     csv = df.to_csv(index=False).encode('utf-8')
                     st.download_button(label="📥 Download Results as CSV", data=csv, file_name="OMR_Results.csv", mime="text/csv")
