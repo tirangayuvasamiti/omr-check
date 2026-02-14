@@ -1,22 +1,24 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
 import pandas as pd
-from typing import List, Tuple, Optional, Dict
-import logging
+from PIL import Image
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# =========================================================
+# YUVA GYAN MAHOTSAV — OMR GRADING TOOL (Ultra Pro UI)
+# =========================================================
 
-# --- CONFIG FOR YUVA GYAN MAHOTSAV 2026 ---
+# -----------------------------
+# PAGE CONFIG
+# -----------------------------
 st.set_page_config(
-    page_title="YUVA GYAN OMR Grader", 
-    layout="wide", 
-    page_icon="🎓"
+    page_title="Yuva Gyan Mahotsav • OMR Grading Tool",
+    layout="wide",
 )
 
-# Answer Key (1-60)
+# -----------------------------
+# ANSWER KEY (1..60) values: 1..4 (A..D)
+# -----------------------------
 ANS_KEY = {
     1: 2, 2: 4, 3: 2, 4: 2, 5: 2, 6: 1, 7: 1, 8: 1, 9: 4, 10: 2,
     11: 1, 12: 1, 13: 4, 14: 1, 15: 2, 16: 1, 17: 4, 18: 2, 19: 2, 20: 3,
@@ -25,475 +27,447 @@ ANS_KEY = {
     41: 2, 42: 1, 43: 4, 44: 3, 45: 2, 46: 3, 47: 1, 48: 1, 49: 1, 50: 1,
     51: 1, 52: 2, 53: 2, 54: 4, 55: 2, 56: 3, 57: 1, 58: 2, 59: 2, 60: 2
 }
+OPTS = {0: "A", 1: "B", 2: "C", 3: "D"}
 
-OPTION_MAP = {0: "A", 1: "B", 2: "C", 3: "D"}
+# =========================================================
+# IMAGE HELPERS
+# =========================================================
+def pil_to_bgr(uploaded_file):
+    img = Image.open(uploaded_file).convert("RGB")
+    arr = np.array(img)
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
-# Layout configuration for this specific OMR sheet
-LAYOUT_CONFIG = {
-    "total_questions": 60,
-    "options_per_question": 4,
-    "columns": 3,
-    "alignment_markers": True,  # Black squares on corners
-}
+def order_points(pts):
+    pts = pts.astype("float32")
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]  # tl
+    rect[2] = pts[np.argmax(s)]  # br
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # tr
+    rect[3] = pts[np.argmax(diff)]  # bl
+    return rect
 
-
-class YuvaGyanOMRProcessor:
-    """Specialized OMR processor for YUVA GYAN MAHOTSAV 2026 sheet"""
-    
-    def __init__(self):
-        # Bubble detection parameters (tuned for this sheet - based on diagnostic)
-        self.min_bubble_area = 200  # Bubbles are ~270 pixels
-        self.max_bubble_area = 2000
-        self.min_circularity = 0.55  # Slightly relaxed for printed circles
-        self.fill_threshold = 0.30  # 30% filled to consider marked
-        self.double_mark_ratio = 0.75  # If 2nd is 75%+ of 1st
-        
-    def load_image(self, uploaded_file) -> np.ndarray:
-        """Load image from uploaded file"""
-        img = Image.open(uploaded_file).convert('RGB')
-        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-    
-    def find_alignment_markers(self, image: np.ndarray) -> List[Tuple[int, int]]:
-        """Find the 4 black corner squares for precise alignment"""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
-        
-        # Find contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Look for square markers (should be 4 of them in corners)
-        markers = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if 100 < area < 800:  # Marker size range
-                x, y, w, h = cv2.boundingRect(cnt)
-                aspect_ratio = w / float(h)
-                if 0.8 < aspect_ratio < 1.2:  # Square-ish
-                    markers.append((x + w//2, y + h//2))
-        
-        return sorted(markers, key=lambda p: (p[1], p[0]))[:4]
-    
-    def preprocess_sheet(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Preprocess and extract ROI - Simplified approach
-        The original blank sheet is already well-aligned, so we just:
-        1. Resize to standard dimensions
-        2. Extract the answer area ROI
-        """
-        # Resize to standard size
-        resized = cv2.resize(image, (1000, 1414), interpolation=cv2.INTER_CUBIC)
-        
-        # Extract answer area (skip header at top, footer at bottom, margins on sides)
-        # Coordinates tuned for this specific sheet layout
-        roi = resized[200:1300, 20:980]
-        
-        return resized, roi
-    
-    def order_points(self, pts: np.ndarray) -> np.ndarray:
-        """Order points as TL, TR, BR, BL"""
-        rect = np.zeros((4, 2), dtype=np.float32)
-        
-        s = pts.sum(axis=1)
-        rect[0] = pts[np.argmin(s)]
-        rect[2] = pts[np.argmax(s)]
-        
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)]
-        rect[3] = pts[np.argmax(diff)]
-        
-        return rect
-    
-    def detect_bubbles(self, roi: np.ndarray) -> Tuple[List, np.ndarray]:
-        """
-        Detect bubbles using optimized processing:
-        1. CLAHE enhancement
-        2. Otsu thresholding (best results from diagnostic)
-        3. Light morphological cleanup
-        4. Contour detection with shape filtering
-        """
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        
-        # CLAHE for better contrast
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        
-        # Otsu's threshold (best method from testing)
-        _, thresh = cv2.threshold(
-            enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )
-        
-        # Light morphological operations
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
-        
-        # Find contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Filter bubbles
-        bubbles = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            
-            # Area filter (bubbles are ~270 pixels)
-            if area < self.min_bubble_area or area > self.max_bubble_area:
-                continue
-            
-            # Bounding box
-            x, y, w, h = cv2.boundingRect(cnt)
-            
-            # Aspect ratio (should be circular)
-            aspect_ratio = w / float(h)
-            if aspect_ratio < 0.6 or aspect_ratio > 1.4:
-                continue
-            
-            # Circularity
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter == 0:
-                continue
-            circularity = 4 * np.pi * area / (perimeter * perimeter)
-            
-            if circularity < self.min_circularity:
-                continue
-            
-            # Calculate center
-            M = cv2.moments(cnt)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-            else:
-                cx, cy = x + w // 2, y + h // 2
-            
-            bubbles.append({
-                'contour': cnt,
-                'center': (cx, cy),
-                'x': x, 'y': y, 'w': w, 'h': h,
-                'area': area,
-                'circularity': circularity
-            })
-        
-        logger.info(f"Detected {len(bubbles)} bubbles")
-        return bubbles, thresh
-    
-    def organize_bubbles(self, bubbles: List[Dict]) -> List[List[Dict]]:
-        """
-        Organize bubbles into 3 columns and rows of 4 (A, B, C, D)
-        
-        Column layout:
-        - Column 1: Q1-22
-        - Column 2: Q23-40  
-        - Column 3: Q41-60
-        """
-        if len(bubbles) < 200:
-            logger.warning(f"Low bubble count: {len(bubbles)}")
-        
-        # Sort by position
-        bubbles = sorted(bubbles, key=lambda b: (b['center'][0], b['center'][1]))
-        
-        # Determine column boundaries (3 equal columns)
-        max_x = max(b['center'][0] for b in bubbles)
-        col_width = max_x / 3
-        
-        # Assign to columns
-        columns = [[], [], []]
-        for b in bubbles:
-            col_idx = min(int(b['center'][0] / col_width), 2)
-            columns[col_idx].append(b)
-        
-        # Sort each column by y-coordinate (top to bottom)
-        for col in columns:
-            col.sort(key=lambda b: b['center'][1])
-        
-        # Group into question rows (sets of 4)
-        all_questions = []
-        
-        for col in columns:
-            for i in range(0, len(col), 4):
-                row = col[i:i+4]
-                if len(row) == 4:
-                    # Sort by x-coordinate (A, B, C, D)
-                    row.sort(key=lambda b: b['center'][0])
-                    all_questions.append(row)
-        
-        return all_questions
-    
-    def calculate_fill_ratio(self, bubble: Dict, thresh: np.ndarray) -> float:
-        """Calculate how filled a bubble is"""
-        mask = np.zeros(thresh.shape, dtype=np.uint8)
-        cv2.drawContours(mask, [bubble['contour']], -1, 255, -1)
-        
-        filled = cv2.countNonZero(cv2.bitwise_and(thresh, mask))
-        total = cv2.countNonZero(mask)
-        
-        return filled / total if total > 0 else 0.0
-    
-    def grade_question(self, q_num: int, bubbles: List[Dict], thresh: np.ndarray) -> Dict:
-        """Grade a single question"""
-        # Calculate fill for each option
-        fills = [(self.calculate_fill_ratio(b, thresh), i, b) for i, b in enumerate(bubbles)]
-        fills.sort(reverse=True, key=lambda x: x[0])
-        
-        # Determine marked options
-        marked = []
-        if fills[0][0] >= self.fill_threshold:
-            marked.append(fills[0][1])
-            
-            # Check for double mark
-            if (len(fills) > 1 and 
-                fills[1][0] >= self.fill_threshold and
-                fills[1][0] >= fills[0][0] * self.double_mark_ratio):
-                marked.append(fills[1][1])
-        
-        # Grade
-        correct_ans = ANS_KEY.get(q_num, 1) - 1
-        
-        is_blank = len(marked) == 0
-        is_double = len(marked) > 1
-        is_correct = (not is_blank and not is_double and marked[0] == correct_ans)
-        
-        if is_blank:
-            status = "Blank"
-        elif is_double:
-            status = "Double Mark"
-        elif is_correct:
-            status = "Correct"
-        else:
-            status = "Incorrect"
-        
-        return {
-            'question': q_num,
-            'marked': marked,
-            'correct': correct_ans,
-            'status': status,
-            'is_correct': is_correct,
-            'is_blank': is_blank,
-            'is_double': is_double
-        }
-    
-    def annotate_sheet(self, roi: np.ndarray, questions: List[List[Dict]], 
-                      results: List[Dict]) -> np.ndarray:
-        """Draw grading annotations on the sheet"""
-        annotated = roi.copy()
-        
-        for row, result in zip(questions, results):
-            if result['is_blank']:
-                # Blue circle on correct answer
-                correct_bubble = row[result['correct']]
-                cv2.drawContours(annotated, [correct_bubble['contour']], -1, (255, 0, 0), 2)
-                
-            elif result['is_double']:
-                # Yellow circles on double marked
-                for idx in result['marked']:
-                    cv2.drawContours(annotated, [row[idx]['contour']], -1, (0, 255, 255), 3)
-                # Blue on correct
-                cv2.drawContours(annotated, [row[result['correct']]['contour']], -1, (255, 0, 0), 2)
-                
-            else:
-                marked_idx = result['marked'][0]
-                if result['is_correct']:
-                    # Green for correct
-                    cv2.drawContours(annotated, [row[marked_idx]['contour']], -1, (0, 255, 0), 3)
-                else:
-                    # Red for incorrect
-                    cv2.drawContours(annotated, [row[marked_idx]['contour']], -1, (0, 0, 255), 3)
-                    # Blue for correct answer
-                    cv2.drawContours(annotated, [row[result['correct']]['contour']], -1, (255, 0, 0), 2)
-        
-        return annotated
-    
-    def process(self, image: np.ndarray) -> Tuple[Optional[Dict], np.ndarray, List[Dict], str]:
-        """Main processing pipeline"""
-        try:
-            # Step 1: Preprocess
-            _, roi = self.preprocess_sheet(image)
-            
-            # Step 2: Detect bubbles
-            bubbles, thresh = self.detect_bubbles(roi)
-            
-            if len(bubbles) < 200:
-                return None, roi, [], f"Error: Only {len(bubbles)} bubbles detected (need ~240)"
-            
-            # Step 3: Organize
-            questions = self.organize_bubbles(bubbles)
-            
-            if len(questions) < 50:
-                return None, roi, [], f"Error: Only {len(questions)} questions organized (need 60)"
-            
-            # Step 4: Grade all questions
-            results = []
-            stats = {"correct": 0, "wrong": 0, "blank": 0, "double": 0}
-            
-            for q_num in range(1, 61):
-                if q_num - 1 < len(questions):
-                    result = self.grade_question(q_num, questions[q_num - 1], thresh)
-                    results.append(result)
-                    
-                    if result['is_correct']:
-                        stats['correct'] += 1
-                    elif result['is_blank']:
-                        stats['blank'] += 1
-                    elif result['is_double']:
-                        stats['double'] += 1
-                        stats['wrong'] += 1
-                    else:
-                        stats['wrong'] += 1
-            
-            # Step 5: Annotate
-            annotated = self.annotate_sheet(roi, questions[:len(results)], results)
-            
-            return stats, annotated, results, "Success"
-            
-        except Exception as e:
-            logger.error(f"Error: {e}", exc_info=True)
-            return None, image, [], f"Error: {str(e)}"
-
-
-# --- STREAMLIT UI ---
-def main():
-    st.title("🎓 YUVA GYAN MAHOTSAV 2026 - OMR Grader")
-    
-    st.markdown("""
-    ### Official OMR Sheet Grading System
-    **Features:**
-    - ✅ Automatic bubble detection
-    - 🎯 Precise alignment correction
-    - 📊 Instant results with detailed analytics
-    - 🎨 Color-coded visual feedback
-    """)
-    
-    # Sidebar
-    with st.sidebar:
-        st.header("📋 Test Information")
-        st.info("""
-        **Total Questions:** 60
-        - English (Q.1-7)
-        - Hindi (Q.8-14)
-        - Mental Ability (Q.15-22)
-        - Computer Science (Q.23-30)
-        - General Knowledge (Q.31-55)
-        - Youth Awareness (Q.56-60)
-        """)
-        
-        st.header("🎨 Color Legend")
-        st.markdown("""
-        - 🟢 **Green** = Correct Answer
-        - 🔴 **Red** = Wrong Answer
-        - 🔵 **Blue** = Correct Answer (reference)
-        - 🟡 **Yellow** = Double Marked
-        """)
-    
-    # File uploader
-    uploaded_file = st.file_uploader(
-        "📤 Upload Filled OMR Sheet",
-        type=['jpg', 'jpeg', 'png'],
-        help="Upload a clear photo of the filled answer sheet"
+def warp_perspective(image, quad, out_w=1400, out_h=1900):
+    rect = order_points(quad)
+    dst = np.array(
+        [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
+        dtype="float32",
     )
-    
-    if uploaded_file:
-        col1, col2 = st.columns([1, 1])
-        
-        with col1:
-            st.subheader("📄 Original Sheet")
-            original_img = Image.open(uploaded_file)
-            st.image(original_img, use_container_width=True)
-        
-        with st.spinner("🔄 Processing OMR sheet..."):
-            try:
-                # Process
-                processor = YuvaGyanOMRProcessor()
-                image = processor.load_image(uploaded_file)
-                stats, annotated, results, message = processor.process(image)
-                
-                if stats:
-                    with col2:
-                        st.subheader("✅ Graded Sheet")
-                        st.image(annotated, channels="BGR", use_container_width=True)
-                    
-                    st.success(f"✅ {message}")
-                    
-                    # Metrics
-                    st.subheader("📊 Results Summary")
-                    metric_cols = st.columns(5)
-                    
-                    total = len(results)
-                    score = stats['correct']
-                    percentage = (score / total * 100) if total > 0 else 0
-                    
-                    metric_cols[0].metric("Total", total)
-                    metric_cols[1].metric("✅ Correct", stats['correct'])
-                    metric_cols[2].metric("❌ Wrong", stats['wrong'])
-                    metric_cols[3].metric("⚠️ Blank", stats['blank'])
-                    metric_cols[4].metric("🔴 Double", stats['double'])
-                    
-                    # Score card
-                    st.subheader("🎯 Final Score")
-                    score_col1, score_col2, score_col3 = st.columns(3)
-                    
-                    with score_col1:
-                        st.metric("Score", f"{score}/{total}")
-                    with score_col2:
-                        st.metric("Percentage", f"{percentage:.2f}%")
-                    with score_col3:
-                        if percentage >= 90:
-                            grade = "A+"
-                            st.balloons()
-                        elif percentage >= 80:
-                            grade = "A"
-                        elif percentage >= 70:
-                            grade = "B"
-                        elif percentage >= 60:
-                            grade = "C"
-                        elif percentage >= 50:
-                            grade = "D"
-                        else:
-                            grade = "E"
-                        st.metric("Grade", grade)
-                    
-                    # Detailed results
-                    st.subheader("📋 Question-wise Analysis")
-                    
-                    df_data = []
-                    for r in results:
-                        marked_str = ", ".join([OPTION_MAP[i] for i in r['marked']]) if r['marked'] else "None"
-                        correct_str = OPTION_MAP[r['correct']]
-                        df_data.append({
-                            "Q.No": r['question'],
-                            "Marked": marked_str,
-                            "Correct": correct_str,
-                            "Status": r['status']
-                        })
-                    
-                    df = pd.DataFrame(df_data)
-                    
-                    # Color coding
-                    def highlight(row):
-                        if row['Status'] == 'Correct':
-                            return ['background-color: #d4edda'] * len(row)
-                        elif row['Status'] == 'Incorrect':
-                            return ['background-color: #f8d7da'] * len(row)
-                        elif row['Status'] == 'Blank':
-                            return ['background-color: #fff3cd'] * len(row)
-                        else:
-                            return ['background-color: #f8d7da'] * len(row)
-                    
-                    st.dataframe(df.style.apply(highlight, axis=1), use_container_width=True, height=400)
-                    
-                    # Download
-                    csv = df.to_csv(index=False)
-                    st.download_button(
-                        "📥 Download Results (CSV)",
-                        csv,
-                        "yuva_gyan_results.csv",
-                        "text/csv"
-                    )
-                    
+    M = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(image, M, (out_w, out_h))
+
+def find_page_quad(image_bgr):
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 60, 180)
+
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    edges = cv2.dilate(edges, k, iterations=2)
+    edges = cv2.erode(edges, k, iterations=1)
+
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:10]
+    H, W = gray.shape[:2]
+
+    for c in cnts:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.contourArea(approx) > 0.30 * (H * W):
+            return approx.reshape(4, 2)
+
+    return None
+
+def adaptive_bin_inv(gray):
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        35, 8
+    )
+    return th
+
+# =========================================================
+# BUBBLE DETECTION / GRID LOGIC (Tuned for your sheet)
+# =========================================================
+def bubble_candidates(bin_img, min_area, max_area):
+    cnts, _ = cv2.findContours(bin_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < min_area or area > max_area:
+            continue
+
+        x, y, w, h = cv2.boundingRect(c)
+        if w < 10 or h < 10:
+            continue
+
+        ar = w / float(h)
+        if ar < 0.75 or ar > 1.30:
+            continue
+
+        peri = cv2.arcLength(c, True)
+        if peri <= 1e-6:
+            continue
+
+        circularity = (4.0 * np.pi * area) / (peri * peri)
+        if circularity < 0.55:
+            continue
+
+        M = cv2.moments(c)
+        if abs(M["m00"]) < 1e-6:
+            continue
+
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+
+        out.append({"c": c, "cx": float(cx), "cy": float(cy), "area": float(area), "w": w, "h": h})
+    return out
+
+def cluster_1d(vals, gap):
+    vals = sorted(vals)
+    groups, cur = [], []
+    for v in vals:
+        if not cur:
+            cur = [v]
+        elif abs(v - cur[-1]) <= gap:
+            cur.append(v)
+        else:
+            groups.append(cur)
+            cur = [v]
+    if cur:
+        groups.append(cur)
+    centers = [float(np.mean(g)) for g in groups]
+    return centers
+
+def nearest_idx(v, centers):
+    return int(np.argmin([abs(v - c) for c in centers]))
+
+def fill_ratio(bin_img, contour, shrink=0.72):
+    mask = np.zeros(bin_img.shape, dtype=np.uint8)
+    cv2.drawContours(mask, [contour], -1, 255, -1)
+
+    x, y, w, h = cv2.boundingRect(contour)
+    cx, cy = x + w / 2.0, y + h / 2.0
+    rr = int(min(w, h) * 0.5 * shrink)
+
+    inner = np.zeros_like(mask)
+    cv2.circle(inner, (int(cx), int(cy)), rr, 255, -1)
+    inner = cv2.bitwise_and(inner, mask)
+
+    inside = cv2.bitwise_and(bin_img, bin_img, mask=inner)
+    filled = cv2.countNonZero(inside)
+    area = cv2.countNonZero(inner)
+    if area <= 0:
+        return 0.0
+    return filled / float(area)
+
+# -----------------------------
+# SHEET ROI + 3-COLUMN SPLIT
+# Based on original sheet layout analysis:
+# Answer zone approx: top~0.23H bottom~0.80H left~0.05W right~0.96W
+# -----------------------------
+def answer_roi(warped):
+    H, W = warped.shape[:2]
+    x1 = int(0.05 * W)
+    x2 = int(0.96 * W)
+    y1 = int(0.23 * H)
+    y2 = int(0.80 * H)
+    return warped[y1:y2, x1:x2].copy()
+
+def split_three_columns(roi):
+    H, W = roi.shape[:2]
+    col1 = roi[:, int(0.00 * W):int(0.34 * W)].copy()
+    col2 = roi[:, int(0.36 * W):int(0.66 * W)].copy()
+    col3 = roi[:, int(0.68 * W):int(1.00 * W)].copy()
+    return [col1, col2, col3]
+
+def grade_column(col_bgr, q_start, overlay_offset_x, overlay_offset_y, overlay, params):
+    min_area = params["min_area"]
+    max_area = params["max_area"]
+    y_gap_factor = params["y_gap_factor"]
+    x_gap_factor = params["x_gap_factor"]
+    blank_thresh = params["blank_thresh"]
+    mark_thresh = params["mark_thresh"]
+    double_rel = params["double_rel"]
+
+    gray = cv2.cvtColor(col_bgr, cv2.COLOR_BGR2GRAY)
+    bin_img = adaptive_bin_inv(gray)
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, k, iterations=1)
+
+    cands = bubble_candidates(bin_img, min_area=min_area, max_area=max_area)
+    if len(cands) < 40:
+        return [], {"error": f"Too few bubbles detected in column Q{q_start}-{q_start+19}. Found={len(cands)}"}
+
+    scale = float(np.median([(d["w"] + d["h"]) / 2.0 for d in cands]))
+    y_gap = max(10.0, scale * y_gap_factor)
+    x_gap = max(10.0, scale * x_gap_factor)
+
+    y_centers = sorted(cluster_1d([d["cy"] for d in cands], gap=y_gap))
+    x_centers = sorted(cluster_1d([d["cx"] for d in cands], gap=x_gap))
+
+    # reduce x centers to 4 strongest if more
+    if len(x_centers) > 4:
+        counts = np.zeros(len(x_centers), dtype=int)
+        for d in cands:
+            counts[nearest_idx(d["cx"], x_centers)] += 1
+        top = np.argsort(counts)[::-1][:4]
+        x_centers = sorted([x_centers[i] for i in top])
+
+    logs = []
+    q = q_start
+
+    rows = [[] for _ in range(len(y_centers))]
+    for d in cands:
+        ri = nearest_idx(d["cy"], y_centers)
+        rows[ri].append(d)
+
+    # sort rows top-to-bottom
+    row_order = np.argsort(y_centers)
+    rows = [rows[i] for i in row_order]
+
+    for r in rows:
+        if q > q_start + 19:
+            break
+
+        per_opt = [[] for _ in range(len(x_centers))]
+        for d in r:
+            ci = nearest_idx(d["cx"], x_centers)
+            per_opt[ci].append(d)
+
+        chosen = []
+        for ci, bucket in enumerate(per_opt):
+            if not bucket:
+                chosen.append(None)
+            else:
+                bucket.sort(key=lambda dd: abs(dd["cx"] - x_centers[ci]))
+                chosen.append(bucket[0])
+
+        if len(chosen) != 4 or any(x is None for x in chosen):
+            logs.append({"Q": q, "Status": "Missing bubbles", "Picked": None, "Answer": OPTS[ANS_KEY[q]-1],
+                         "BestFill": None, "SecondFill": None, "Confidence": 0.0})
+            q += 1
+            continue
+
+        ratios = [(fill_ratio(bin_img, chosen[j]["c"], shrink=0.72), j) for j in range(4)]
+        ratios.sort(key=lambda x: x[0], reverse=True)
+
+        best, best_j = ratios[0]
+        second, second_j = ratios[1]
+        k_ans = ANS_KEY[q] - 1
+
+        conf = float(np.clip((best - second) / max(best, 1e-6), 0, 1))
+
+        def draw_global(contour, color, thick=3):
+            shifted = contour.copy()
+            shifted[:, 0, 0] += overlay_offset_x
+            shifted[:, 0, 1] += overlay_offset_y
+            cv2.drawContours(overlay, [shifted], -1, color, thick)
+
+        if best < blank_thresh:
+            status = "Blank"
+            picked = None
+            draw_global(chosen[k_ans]["c"], (255, 0, 0), 2)  # correct in blue
+        else:
+            if (best >= mark_thresh) and (second >= mark_thresh) and (second >= best * double_rel):
+                status = "Double"
+                picked = None
+                draw_global(chosen[best_j]["c"], (0, 255, 255), 3)
+                draw_global(chosen[second_j]["c"], (0, 255, 255), 3)
+                draw_global(chosen[k_ans]["c"], (255, 0, 0), 2)
+            else:
+                picked = best_j
+                if picked == k_ans:
+                    status = "Correct"
+                    draw_global(chosen[picked]["c"], (0, 255, 0), 3)
                 else:
-                    st.error(f"❌ {message}")
-                    st.info("💡 Tips: Ensure good lighting, flat surface, and all bubbles are visible")
-                    
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-                st.exception(e)
+                    status = "Incorrect"
+                    draw_global(chosen[picked]["c"], (0, 0, 255), 3)
+                    draw_global(chosen[k_ans]["c"], (255, 0, 0), 2)
 
+        logs.append({
+            "Q": q,
+            "Status": status,
+            "Picked": OPTS[picked] if picked is not None else None,
+            "Answer": OPTS[k_ans],
+            "BestFill": round(best, 3),
+            "SecondFill": round(second, 3),
+            "Confidence": round(conf, 3),
+        })
+        q += 1
 
-if __name__ == "__main__":
-    main()
+    return logs, {"rows": len(y_centers), "x_centers": x_centers, "bubble_scale": round(scale, 2), "bubbles_found": len(cands)}
+
+def grade_sheet(image_bgr, params):
+    quad = find_page_quad(image_bgr)
+    if quad is None:
+        warped = cv2.resize(image_bgr, (1400, 1900))
+        doc_mode = "fallback_resize"
+    else:
+        warped = warp_perspective(image_bgr, quad, 1400, 1900)
+        doc_mode = "warp_from_quad"
+
+    roi = answer_roi(warped)
+    overlay = roi.copy()
+
+    cols = split_three_columns(roi)
+    H, W = roi.shape[:2]
+    offsets = [(0, 0), (int(0.36 * W), 0), (int(0.68 * W), 0)]
+    starts = [1, 21, 41]
+
+    all_logs = []
+    debug = {"doc_mode": doc_mode}
+
+    for i in range(3):
+        logs, info = grade_column(
+            cols[i],
+            q_start=starts[i],
+            overlay_offset_x=offsets[i][0],
+            overlay_offset_y=offsets[i][1],
+            overlay=overlay,
+            params=params,
+        )
+        debug[f"col_{i+1}"] = info
+        all_logs.extend(logs)
+
+    df = pd.DataFrame(all_logs).sort_values("Q")
+
+    stats = {"correct": 0, "wrong": 0, "blank": 0, "double": 0, "missing": 0}
+    for s in df["Status"].tolist():
+        if s == "Correct":
+            stats["correct"] += 1
+        elif s == "Incorrect":
+            stats["wrong"] += 1
+        elif s == "Blank":
+            stats["blank"] += 1
+        elif s == "Double":
+            stats["double"] += 1
+        elif s == "Missing bubbles":
+            stats["missing"] += 1
+
+    return stats, overlay, roi, debug, df
+
+# =========================================================
+# ULTRA PRO UI
+# =========================================================
+
+# ---- top bar (minimal, pro) ----
+st.markdown(
+    """
+    <div style="padding: 14px 16px; border-radius: 14px; background: linear-gradient(90deg, #0B1220, #111C33); border:1px solid rgba(255,255,255,0.08);">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div>
+          <div style="font-size:18px; font-weight:700; color:#EAF2FF; line-height:1.2;">
+            Yuva Gyan Mahotsav • OMR Grading Tool
+          </div>
+          <div style="font-size:12px; color:rgba(234,242,255,0.72); margin-top:4px;">
+            Fast • Accurate • Audit-friendly (Blank/Double/Missing detection)
+          </div>
+        </div>
+        <div style="font-size:12px; color:rgba(234,242,255,0.72); text-align:right;">
+          Layout tuned to official sheet<br/>
+          <a href="https://www.genspark.ai/api/files/s/6eWzcOhD" target="_blank" style="color:#9AD0FF; text-decoration:none;">View reference OMR</a>
+        </div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.write("")
+
+# ---- main action row ----
+left, right = st.columns([1.35, 1])
+
+with left:
+    uploaded = st.file_uploader("Upload filled OMR image", type=["jpg", "jpeg", "png"], label_visibility="collapsed")
+
+with right:
+    st.markdown(
+        """
+        <div style="padding:12px 14px; border-radius:14px; border:1px solid rgba(0,0,0,0.08); background:#F7F9FC;">
+            <div style="font-weight:700; font-size:13px;">Recommended upload</div>
+            <div style="font-size:12px; color:#334155; margin-top:6px;">
+                • Flat scan / top-down photo<br/>
+                • Good lighting (avoid shadows)<br/>
+                • Full sheet visible (borders included)
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+# ---- advanced (hidden) ----
+with st.expander("Advanced (Calibration)", expanded=False):
+    st.caption("Use only if detection is weak on real photos. Defaults are tuned for your sheet.")
+    params = {
+        "min_area": st.slider("Min bubble area", 50, 2000, 220, 10),
+        "max_area": st.slider("Max bubble area", 1000, 20000, 9000, 100),
+        "y_gap_factor": st.slider("Row clustering gap factor", 0.8, 3.0, 1.45, 0.05),
+        "x_gap_factor": st.slider("Option clustering gap factor", 0.8, 3.0, 1.45, 0.05),
+        "blank_thresh": st.slider("Blank threshold (fill ratio)", 0.02, 0.30, 0.10, 0.01),
+        "mark_thresh": st.slider("Marked threshold (fill ratio)", 0.05, 0.50, 0.18, 0.01),
+        "double_rel": st.slider("Double similarity (2nd/best)", 0.60, 0.98, 0.85, 0.01),
+    }
+if "params" not in locals():
+    # clean default (no clutter)
+    params = {
+        "min_area": 220,
+        "max_area": 9000,
+        "y_gap_factor": 1.45,
+        "x_gap_factor": 1.45,
+        "blank_thresh": 0.10,
+        "mark_thresh": 0.18,
+        "double_rel": 0.85,
+    }
+
+# ---- run grading ----
+if uploaded:
+    img = pil_to_bgr(uploaded)
+
+    with st.spinner("Grading OMR…"):
+        stats, overlay, roi, debug, df = grade_sheet(img, params)
+
+    # KPI strip (compact pro)
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Correct", stats["correct"])
+    k2.metric("Incorrect", stats["wrong"])
+    k3.metric("Blank", stats["blank"])
+    k4.metric("Double", stats["double"])
+    k5.metric("Missing", stats["missing"])
+
+    # Tabs (only what’s needed)
+    tab1, tab2 = st.tabs(["Checked Sheet", "Results"])
+    with tab1:
+        st.image(overlay, channels="BGR", use_container_width=True)
+        st.caption("Legend: Green=Correct • Red=Wrong • Blue=Correct Answer • Yellow=Double")
+
+        # optional debug (collapsed)
+        with st.expander("Diagnostics", expanded=False):
+            st.json(debug)
+
+        # Download annotated image
+        # Convert BGR -> RGB and encode as PNG
+        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        ok, buf = cv2.imencode(".png", overlay_rgb)
+        if ok:
+            st.download_button(
+                "Download Checked Sheet (PNG)",
+                data=buf.tobytes(),
+                file_name="checked_sheet.png",
+                mime="image/png",
+            )
+
+    with tab2:
+        st.dataframe(df, use_container_width=True, height=520)
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download Results (CSV)", data=csv, file_name="omr_results.csv", mime="text/csv")
+
+else:
+    st.info("Upload a filled OMR image to start grading.")
