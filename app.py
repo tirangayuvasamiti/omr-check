@@ -6,14 +6,18 @@ from imutils.perspective import four_point_transform
 from imutils import contours as imutils_contours
 from PIL import Image
 
-# --- SCORING RULES ---
-CORRECT_PTS = 3
-WRONG_PTS = 1  # This value is subtracted
-TOTAL_QUESTIONS = 60
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="Yuva Gyan Grader Pro", layout="wide", page_icon="🎓")
 
-# --- VERIFIED ANSWER KEY (Derived from your provided images) ---
+# --- CONSTANTS & SCORING RULES ---
+CORRECT_PTS = 3
+WRONG_PTS = 1  # Subtracted
+TOTAL_QUESTIONS = 60
+EXPECTED_BUBBLES = 240
+
+# --- VERIFIED ANSWER KEY ---
 # A=0, B=1, C=2, D=3
-ans_key = {
+ANS_KEY = {
     1: 1, 2: 3, 3: 1, 4: 1, 5: 1, 6: 0, 7: 0, 8: 0, 9: 3, 10: 1,
     11: 0, 12: 0, 13: 3, 14: 0, 15: 1, 16: 0, 17: 3, 18: 1, 19: 1, 20: 2,
     21: 3, 22: 1, 23: 0, 24: 1, 25: 3, 26: 0, 27: 2, 28: 3, 29: 3, 30: 2,
@@ -22,12 +26,15 @@ ans_key = {
     51: 0, 52: 1, 53: 1, 54: 3, 55: 1, 56: 2, 57: 0, 58: 1, 59: 1, 60: 1
 }
 
-def process_omr(image_np):
-    # 1. Detect Paper & Perspective Transform
+def process_omr(image_np, debug=False):
+    """Processes the OMR sheet and returns scores, bubble count, and processed images."""
     orig = image_np.copy()
     gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+    
+    # 1. Detect Paper & Perspective Transform (Added dilation for better edge detection)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edged = cv2.Canny(blurred, 75, 200)
+    edged = cv2.dilate(edged, None, iterations=1) 
 
     cnts = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cnts = imutils.grab_contours(cnts)
@@ -42,7 +49,7 @@ def process_omr(image_np):
                 docCnt = approx
                 break
 
-    # If paper is found, warp it. If not, fallback to original image.
+    # Apply warp perspective
     if docCnt is not None:
         paper = four_point_transform(gray, docCnt.reshape(4, 2))
         color_paper = four_point_transform(orig, docCnt.reshape(4, 2))
@@ -53,35 +60,45 @@ def process_omr(image_np):
     # 2. Thresholding
     paper = imutils.resize(paper, height=1500)
     color_paper = imutils.resize(color_paper, height=1500)
-    thresh = cv2.adaptiveThreshold(paper, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+    
+    # Using Otsu's thresholding for better dynamic range handling
+    blurred_paper = cv2.GaussianBlur(paper, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(blurred_paper, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                    cv2.THRESH_BINARY_INV, 51, 11)
 
     # 3. Find Bubbles
     cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cnts = imutils.grab_contours(cnts)
     bubbles = []
+    
     for c in cnts:
         (x, y, w, h) = cv2.boundingRect(c)
         ar = w / float(h)
-        if 20 <= w <= 45 and 20 <= h <= 45 and 0.8 <= ar <= 1.2:
+        # Slightly relaxed constraints to handle slight skews
+        if 15 <= w <= 55 and 15 <= h <= 55 and 0.7 <= ar <= 1.3:
             bubbles.append(c)
 
-    if len(bubbles) < 240:
-        return None, len(bubbles), color_paper
+    # If we found too many bubbles (noise), filter by perfectly circular contours
+    if len(bubbles) > EXPECTED_BUBBLES:
+        bubbles = sorted(bubbles, key=lambda c: abs(1.0 - (cv2.boundingRect(c)[2] / float(cv2.boundingRect(c)[3]))))
+        bubbles = bubbles[:EXPECTED_BUBBLES]
 
-    # 4. Sorting logic (Left-to-Right for Columns)
+    if len(bubbles) < EXPECTED_BUBBLES:
+        return None, len(bubbles), color_paper, thresh
+
+    # 4. Sorting logic (Left-to-Right for 3 Columns)
     bubbles = imutils_contours.sort_contours(bubbles, method="left-to-right")[0]
     cols = [bubbles[0:80], bubbles[80:160], bubbles[160:240]]
     
-    results = {"correct": 0, "wrong": 0, "blank": 0}
+    results = {"correct": 0, "wrong": 0, "blank": 0, "double": 0}
     q_idx = 1
 
     for col in cols:
         col_cnts = imutils_contours.sort_contours(col, method="top-to-bottom")[0]
+        
         for i in np.arange(0, len(col_cnts), 4):
             row = imutils_contours.sort_contours(col_cnts[i:i+4], method="left-to-right")[0]
-            bubbled = None
-            max_px = 0
+            bubbled_answers = []
             
             for (j, c) in enumerate(row):
                 mask = np.zeros(thresh.shape, dtype="uint8")
@@ -89,62 +106,107 @@ def process_omr(image_np):
                 mask = cv2.bitwise_and(thresh, thresh, mask=mask)
                 total = cv2.countNonZero(mask)
                 
-                if total > 400 and total > max_px:
-                    max_px = total
-                    bubbled = j
+                # Dynamic Thresholding: Check if > 40% of the bubble area is filled
+                (x, y, w, h) = cv2.boundingRect(c)
+                bubble_area = w * h
+                fill_ratio = total / float(bubble_area)
+                
+                if fill_ratio > 0.40:  # 40% threshold (Adjustable)
+                    bubbled_answers.append(j)
 
-            # Grading against Master Key
-            correct_ans = ans_key.get(q_idx)
-            if bubbled is None:
+            correct_ans = ANS_KEY.get(q_idx)
+
+            # Grading Logic
+            if len(bubbled_answers) == 0:
                 results["blank"] += 1
-            elif bubbled == correct_ans:
+            elif len(bubbled_answers) > 1:
+                results["double"] += 1
+                results["wrong"] += 1 # Treat double bubble as wrong
+                for b in bubbled_answers:
+                    cv2.drawContours(color_paper, [row[b]], -1, (0, 255, 255), 3) # Yellow for double
+            elif bubbled_answers[0] == correct_ans:
                 results["correct"] += 1
-                cv2.drawContours(color_paper, [row[bubbled]], -1, (0, 255, 0), 3) # Green
+                cv2.drawContours(color_paper, [row[bubbled_answers[0]]], -1, (0, 255, 0), 3) # Green
             else:
                 results["wrong"] += 1
-                cv2.drawContours(color_paper, [row[bubbled]], -1, (0, 0, 255), 3) # Red
+                cv2.drawContours(color_paper, [row[bubbled_answers[0]]], -1, (0, 0, 255), 3) # Red
                 cv2.drawContours(color_paper, [row[correct_ans]], -1, (255, 0, 0), 2) # Blue Correct
+            
             q_idx += 1
 
-    return results, 240, color_paper
+    return results, len(bubbles), color_paper, thresh
 
 # --- UI ---
-st.set_page_config(page_title="Yuva Gyan Grader", layout="wide")
-st.title("Yuva Gyan Mahotsav 2026")
-st.write("Scan OMR sheets instantly using your camera.")
+st.title("🎓 Yuva Gyan Mahotsav 2026")
+st.markdown("Scan OMR sheets instantly. Powered by OpenCV & Streamlit.")
 
-camera_img = st.camera_input("Take a photo of the OMR sheet")
-upload_img = st.file_uploader("Or upload an image", type=['jpg','png','jpeg'])
+with st.sidebar:
+    st.header("⚙️ Settings")
+    debug_mode = st.toggle("Enable Debug Mode", help="Show binary thresholding map to debug lighting issues.")
+    st.info("Ensure the OMR sheet fills the camera view and lies flat in good lighting.")
+
+col1, col2 = st.columns(2)
+with col1:
+    camera_img = st.camera_input("Take a photo of the OMR sheet")
+with col2:
+    upload_img = st.file_uploader("Or upload an image", type=['jpg','png','jpeg'])
 
 input_file = camera_img if camera_img else upload_img
 
 if input_file:
-    img = Image.open(input_file)
+    # Convert file to OpenCV format safely
+    img = Image.open(input_file).convert('RGB')
     img_np = np.array(img)
     img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     
-    with st.spinner("Grading..."):
-        data, count, processed_img = process_omr(img_np)
-        
-        if data is None:
-            st.error(f"Detection Error: Found {count}/240 bubbles. Please hold the camera closer/straighter.")
-            st.image(processed_img, caption="What the AI sees", use_container_width=True)
-        else:
-            pos = data['correct'] * CORRECT_PTS
-            neg = data['wrong'] * WRONG_PTS
-            total = pos - neg
+    with st.spinner("Analyzing OMR Sheet..."):
+        try:
+            data, count, processed_img, thresh_img = process_omr(img_np, debug=debug_mode)
             
-            col_res, col_img = st.columns([1, 1])
-            with col_res:
+            if data is None:
+                st.error(f"⚠️ **Detection Error:** Found {count}/{EXPECTED_BUBBLES} bubbles. Please hold the camera closer/straighter.")
+                
+                # Debugging visualizer
+                st.write("### What the AI sees:")
+                debug_col1, debug_col2 = st.columns(2)
+                debug_col1.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), caption="Perspective View", use_container_width=True)
+                debug_col2.image(thresh_img, caption="Binary Map (Ensure bubbles are clear white dots)", use_container_width=True, clamp=True)
+                
+            else:
+                pos = data['correct'] * CORRECT_PTS
+                neg = data['wrong'] * WRONG_PTS
+                total = pos - neg
+                
+                st.markdown("---")
                 st.markdown("### 📊 OFFICIAL SCORECARD")
-                st.info(f"**CORRECT:** {data['correct']}")
-                st.error(f"**INCORRECT:** {data['wrong']}")
-                st.warning(f"**UNATTEMPTED:** {data['blank']}")
-                st.divider()
-                st.write(f"**POS. SCORE (+):** {pos}")
-                st.write(f"**NEG. SCORE (-):** {neg}")
-                st.success(f"## TOTAL SCORE: {total}")
-            
-            with col_img:
-                st.markdown("### Visual Verification")
-                st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+                
+                # Dashboard style metrics
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Correct", data['correct'], f"+{pos} pts")
+                m2.metric("Incorrect", data['wrong'], f"-{neg} pts")
+                m3.metric("Unattempted", data['blank'])
+                m4.metric("Double Marked", data['double'], help="Counted as incorrect")
+                m5.metric("FINAL SCORE", total)
+
+                st.markdown("---")
+                
+                col_img1, col_img2 = st.columns([1, 1])
+                with col_img1:
+                    st.markdown("#### 🔍 Visual Verification")
+                    st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+                
+                with col_img2:
+                    if debug_mode:
+                        st.markdown("#### 🛠️ AI Threshold Map")
+                        st.image(thresh_img, use_container_width=True, clamp=True)
+                    else:
+                        st.success("✅ OMR Graded Successfully!")
+                        st.write("**Legend:**")
+                        st.write("🟢 **Green:** Correct")
+                        st.write("🔴 **Red:** Incorrect (Student's Answer)")
+                        st.write("🔵 **Blue:** Missed Correct Answer")
+                        st.write("🟡 **Yellow:** Invalid (Double Bubbled)")
+                        
+        except Exception as e:
+            st.error(f"An unexpected error occurred: {e}")
+            st.info("Try turning on 'Debug Mode' in the sidebar to see what is failing.")
