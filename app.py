@@ -3,18 +3,15 @@ import cv2
 import numpy as np
 import imutils
 from imutils.perspective import four_point_transform
-from imutils import contours as imutils_contours
 from PIL import Image
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Yuva Gyan Grader Pro", layout="wide", page_icon="📝")
+st.set_page_config(page_title="Yuva Gyan Ultra Grader", layout="wide", page_icon="⚡")
 
-# --- SCORING RULES ---
+# --- RULES & KEY ---
 CORRECT_PTS = 3
 WRONG_PTS = 1  # Subtracted
-EXPECTED_BUBBLES = 240
 
-# --- VERIFIED ANSWER KEY ---
 # NORMAL FORMAT: A=1, B=2, C=3, D=4
 ANS_KEY = {
     1: 2, 2: 4, 3: 2, 4: 2, 5: 2, 6: 1, 7: 1, 8: 1, 9: 4, 10: 2,
@@ -25,206 +22,177 @@ ANS_KEY = {
     51: 1, 52: 2, 53: 2, 54: 4, 55: 2, 56: 3, 57: 1, 58: 2, 59: 2, 60: 2
 }
 
-def get_warp_points(gray, mode):
-    """Finds the 4 anchor points of the document using the chosen method."""
+def find_corner_fiducials(gray):
+    """New Engine: Finds the 4 corner machine marks by searching the 4 extremes."""
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    # Aggressive thresholding for black marks on white paper
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 15)
     
-    # METHOD 1: Page Edges (Standard)
-    def scan_page_edges():
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(blurred, 75, 200)
-        cnts = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cnts = imutils.grab_contours(cnts)
-        if len(cnts) > 0:
-            cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
-            for c in cnts:
-                peri = cv2.arcLength(c, True)
-                approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-                # Must be 4 points and reasonably large
-                if len(approx) == 4 and cv2.contourArea(approx) > 50000:
-                    return approx.reshape(4, 2)
-        return None
-
-    # METHOD 2: Corner Marks (Fiducials)
-    def scan_corner_marks():
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 11)
-        cnts = cv2.findContours(thresh.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        cnts = imutils.grab_contours(cnts)
-        markers = []
-        for c in cnts:
-            area = cv2.contourArea(c)
-            (x, y, w, h) = cv2.boundingRect(c)
+    cnts, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    
+    candidates = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if 50 < area < 25000:  # Broad range to catch big/small markers
+            x, y, w, h = cv2.boundingRect(c)
             ar = w / float(h)
-            if 100 < area < 15000 and 0.5 <= ar <= 1.5:
+            if 0.5 <= ar <= 1.5:  # Roughly square/circular
                 hull = cv2.convexHull(c)
                 if cv2.contourArea(hull) > 0:
-                    solidity = area / float(cv2.contourArea(hull))
-                    if solidity > 0.6:  # Mostly solid shape
+                    solidity = area / cv2.contourArea(hull)
+                    if solidity > 0.7:  # Solid black filled shape
                         M = cv2.moments(c)
-                        if M["m00"] != 0:
-                            markers.append([int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])])
-        
-        if len(markers) >= 4:
-            pts = np.array(markers)
-            s = pts.sum(axis=1)
-            diff = np.diff(pts, axis=1)
-            tl = pts[np.argmin(s)]
-            br = pts[np.argmax(s)]
-            tr = pts[np.argmin(diff)]
-            bl = pts[np.argmax(diff)]
-            return np.array([tl, tr, br, bl], dtype="float32")
+                        if M["m00"] > 0:
+                            cx = int(M["m10"] / M["m00"])
+                            cy = int(M["m01"] / M["m00"])
+                            candidates.append((cx, cy))
+                            
+    if len(candidates) < 4:
         return None
 
-    # Logic based on user selection
-    if mode == "Page Edges (Standard)":
-        return scan_page_edges()
-    elif mode == "Corner Marks (Fiducials)":
-        return scan_corner_marks()
-    else:  # Auto (Try Edges first, then Marks)
-        pts = scan_page_edges()
-        if pts is None:
-            pts = scan_corner_marks()
-        return pts
-
-def process_omr(image_np, align_mode, debug=False, show_missed=False):
-    orig = image_np.copy()
+    # Sort candidates into the 4 corners mathematically
+    h, w = gray.shape
+    corners = [(0, 0), (w, 0), (w, h), (0, h)] # TL, TR, BR, BL
+    final_pts = []
     
-    # 1. Resize for standard math
-    orig = imutils.resize(orig, height=1500)
+    for corner in corners:
+        # Find the candidate with the shortest geometric distance to the actual image corner
+        best_pt = min(candidates, key=lambda p: (p[0] - corner[0])**2 + (p[1] - corner[1])**2)
+        final_pts.append([best_pt[0], best_pt[1]])
+        
+    return np.array(final_pts, dtype="float32")
+
+def process_omr_ultra(image_np, show_missed=False):
+    # 1. Image Prep
+    orig = imutils.resize(image_np, height=1200)
     gray = cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY)
     
-    # 2. Get the anchor points using chosen method
-    anchor_pts = get_warp_points(gray, align_mode)
+    # 2. Fiducial Warp (Corner Marks)
+    corner_pts = find_corner_fiducials(gray)
+    if corner_pts is None:
+        return None, "Error: Could not find all 4 corner machine marks. Ensure they are visible."
 
-    # 3. Perspective Transform
-    if anchor_pts is not None:
-        paper = four_point_transform(gray, anchor_pts)
-        color_paper = four_point_transform(orig, anchor_pts)
-    else:
-        # Fallback if both methods completely fail
-        paper = gray
-        color_paper = orig
-
-    # 4. Bubble Thresholding
-    paper = imutils.resize(paper, height=1500)
-    color_paper = imutils.resize(color_paper, height=1500)
+    # Warp to a strict, standardized size (Width: 1200, Height: 1600)
+    warped_gray = four_point_transform(gray, corner_pts)
+    warped_color = four_point_transform(orig, corner_pts)
+    warped_gray = cv2.resize(warped_gray, (1200, 1600))
+    warped_color = cv2.resize(warped_color, (1200, 1600))
     
-    thresh = cv2.adaptiveThreshold(paper, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 51, 11)
+    # 3. Thresholding for Bubbles
+    thresh = cv2.adaptiveThreshold(warped_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 11)
 
-    # 5. Find Bubbles
-    cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = imutils.grab_contours(cnts)
-    bubbles = []
+    # 4. Vertical Slicing Mechanism
+    # The sheet has 3 columns. We slice the image into 3 vertical zones to prevent row cross-contamination.
+    slices = [
+        {"x_start": 0, "x_end": 400, "q_start": 1, "q_end": 20},
+        {"x_start": 400, "x_end": 800, "q_start": 21, "q_end": 40},
+        {"x_start": 800, "x_end": 1200, "q_start": 41, "q_end": 60}
+    ]
     
-    for c in cnts:
-        (x, y, w, h) = cv2.boundingRect(c)
-        ar = w / float(h)
-        # Widened constraints to catch bubbles even if warp is imperfect
-        if 15 <= w <= 60 and 15 <= h <= 60 and 0.6 <= ar <= 1.4:
-            bubbles.append(c)
-
-    # Noise filter: Keep only the 240 most perfectly circular bubbles
-    if len(bubbles) > EXPECTED_BUBBLES:
-        bubbles = sorted(bubbles, key=lambda c: abs(1.0 - (cv2.boundingRect(c)[2] / float(cv2.boundingRect(c)[3]))))
-        bubbles = bubbles[:EXPECTED_BUBBLES]
-
-    # Diagnostic image
-    debug_img = color_paper.copy()
-    cv2.drawContours(debug_img, bubbles, -1, (255, 0, 255), 2)
-
-    if len(bubbles) != EXPECTED_BUBBLES:
-        return None, len(bubbles), color_paper, debug_img, f"Bubble count mismatch. Alignment Mode used: '{align_mode}'."
-
-    # 6. Sorting & Grading
-    try:
-        bubbles = imutils_contours.sort_contours(bubbles, method="left-to-right")[0]
-        cols = [bubbles[0:80], bubbles[80:160], bubbles[160:240]]
+    results = {"correct": 0, "wrong": 0, "blank": 0, "double": 0}
+    debug_img = warped_color.copy()
+    
+    for s_idx, sl in enumerate(slices):
+        slice_thresh = thresh[:, sl["x_start"]:sl["x_end"]]
         
-        results = {"correct": 0, "wrong": 0, "blank": 0, "double": 0}
-        q_idx = 1
+        # Find bubbles in this specific slice
+        cnts, _ = cv2.findContours(slice_thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        bubbles = []
+        
+        for c in cnts:
+            x, y, w, h = cv2.boundingRect(c)
+            ar = w / float(h)
+            if 15 <= w <= 55 and 15 <= h <= 55 and 0.6 <= ar <= 1.4:
+                # Add offset back so coordinates match the main image
+                bubbles.append((x + sl["x_start"], y, w, h, c))
+                
+        # Filter to exact 80 bubbles (20 questions * 4 options)
+        if len(bubbles) > 80:
+            # Sort by circularity to drop noise
+            bubbles = sorted(bubbles, key=lambda b: abs(1.0 - (b[2]/float(b[3]))))[:80]
+        elif len(bubbles) < 80:
+            return None, f"Error in Column {s_idx + 1}: Found {len(bubbles)}/80 bubbles. Ensure column is clear."
 
-        for col in cols:
-            col_cnts = imutils_contours.sort_contours(col, method="top-to-bottom")[0]
+        # Sort top-to-bottom
+        bubbles = sorted(bubbles, key=lambda b: b[1])
+        
+        # Grade Row by Row
+        current_q = sl["q_start"]
+        for i in range(0, 80, 4):
+            # Take a row of 4 options and sort left-to-right
+            row = bubbles[i:i+4]
+            row = sorted(row, key=lambda b: b[0])
             
-            for i in np.arange(0, len(col_cnts), 4):
-                row = imutils_contours.sort_contours(col_cnts[i:i+4], method="left-to-right")[0]
+            pixel_counts = []
+            for j, (bx, by, bw, bh, bc) in enumerate(row):
+                # Inner Core Mask: Only look at the very center of the bubble!
+                mask = np.zeros(warped_gray.shape, dtype="uint8")
+                # Draw a circle 40% the size of the bounding box at the center
+                cv2.circle(mask, (int(bx + bw/2), int(by + bh/2)), int(min(bw, bh) * 0.35), 255, -1)
                 
-                pixel_counts = []
-                for (j, c) in enumerate(row):
-                    mask = np.zeros(thresh.shape, dtype="uint8")
-                    cv2.drawContours(mask, [c], -1, 255, -1)
-                    mask = cv2.bitwise_and(thresh, thresh, mask=mask)
-                    total = cv2.countNonZero(mask)
-                    pixel_counts.append((total, j))
+                core_thresh = cv2.bitwise_and(thresh, thresh, mask=mask)
+                total_pixels = cv2.countNonZero(core_thresh)
+                pixel_counts.append((total_pixels, j, (bx, by, bw, bh)))
                 
-                pixel_counts.sort(key=lambda x: x[0], reverse=True)
-                
-                darkest_val, darkest_idx = pixel_counts[0]
-                second_darkest_val = pixel_counts[1][0]
-                
-                correct_ans = ANS_KEY.get(q_idx)
-                correct_ans_idx = correct_ans - 1 
-                
-                # --- GRADING LOGIC ---
-                if darkest_val < 300: 
-                    results["blank"] += 1
-                    if show_missed:
-                        cv2.drawContours(color_paper, [row[correct_ans_idx]], -1, (255, 0, 0), 2)
-                        
-                elif second_darkest_val > (darkest_val * 0.75): 
-                    results["double"] += 1
-                    results["wrong"] += 1
-                    cv2.drawContours(color_paper, [row[darkest_idx], row[pixel_counts[1][1]]], -1, (0, 255, 255), 3)
-                    if show_missed:
-                        cv2.drawContours(color_paper, [row[correct_ans_idx]], -1, (255, 0, 0), 2)
-                        
-                elif darkest_idx == correct_ans_idx:
-                    results["correct"] += 1
-                    cv2.drawContours(color_paper, [row[darkest_idx]], -1, (0, 255, 0), 3)
+                # Draw diagnostics
+                cv2.circle(debug_img, (int(bx + bw/2), int(by + bh/2)), int(min(bw, bh) * 0.35), (255, 0, 255), 1)
+
+            pixel_counts.sort(key=lambda x: x[0], reverse=True)
+            darkest_val, darkest_idx, darkest_box = pixel_counts[0]
+            second_darkest_val = pixel_counts[1][0]
+            
+            correct_ans_human = ANS_KEY.get(current_q)
+            correct_ans_ai = correct_ans_human - 1 # Convert to 0-3 index
+            
+            # Draw contour helper
+            def draw_box(b_box, color, thickness=3):
+                cv2.rectangle(warped_color, (b_box[0], b_box[1]), (b_box[0]+b_box[2], b_box[1]+b_box[3]), color, thickness)
+
+            # Grading Logic
+            if darkest_val < 50: 
+                # Inner core has less than 50 filled pixels = BLANK
+                results["blank"] += 1
+                if show_missed:
+                    draw_box(row[correct_ans_ai][0:4], (255, 0, 0), 2) # Blue
                     
-                else:
-                    results["wrong"] += 1
-                    cv2.drawContours(color_paper, [row[darkest_idx]], -1, (0, 0, 255), 3) 
-                    if show_missed:
-                        cv2.drawContours(color_paper, [row[correct_ans_idx]], -1, (255, 0, 0), 2)
+            elif second_darkest_val > (darkest_val * 0.65): 
+                # DOUBLE BUBBLE
+                results["double"] += 1
+                results["wrong"] += 1
+                draw_box(darkest_box, (0, 255, 255)) # Yellow
+                draw_box(pixel_counts[1][2], (0, 255, 255))
+                if show_missed:
+                    draw_box(row[correct_ans_ai][0:4], (255, 0, 0), 2)
+                    
+            elif darkest_idx == correct_ans_ai:
+                results["correct"] += 1
+                draw_box(darkest_box, (0, 255, 0)) # Green
                 
-                q_idx += 1
+            else:
+                results["wrong"] += 1
+                draw_box(darkest_box, (0, 0, 255)) # Red
+                if show_missed:
+                    draw_box(row[correct_ans_ai][0:4], (255, 0, 0), 2) # Blue
+            
+            current_q += 1
 
-        return results, len(bubbles), color_paper, debug_img, "Success"
-
-    except Exception as e:
-        return None, len(bubbles), color_paper, debug_img, f"Sorting Error: Image could not be aligned properly. ({str(e)})"
-
+    return results, warped_color, debug_img, "Success"
 
 # --- UI ---
-st.title("📝 Yuva Gyan Mahotsav OMR Grader")
+st.title("⚡ Yuva Gyan Ultra Grader")
 
 with st.sidebar:
-    st.header("⚙️ Scanner Controls")
-    
-    # NEW FEATURE: Let the user choose the alignment method!
-    align_mode = st.radio(
-        "Alignment Method (If it fails, try a different one):",
-        ["Auto (Try Both)", "Page Edges (Standard)", "Corner Marks (Fiducials)"]
-    )
-    
+    st.header("⚙️ Output Settings")
+    show_missed = st.toggle("Show Missed Answers (Blue)", value=True, help="Draws a blue box to show the right answer on mistakes.")
     st.divider()
-    st.header("⚙️ Display Settings")
-    show_missed = st.toggle("Show Missed Answers (Blue)", value=False, help="Draws a blue circle to show the right answer on mistakes.")
-    debug_mode = st.toggle("View AI Diagnostics", value=False, help="Shows exactly which bubbles the AI is finding if an error occurs.")
+    st.info("💡 **Instructions:**\n1. Use the Mobile Camera tab.\n2. Ensure the **4 black corner dots/squares** are clearly in the frame.\n3. The app will automatically isolate, slice, and read the inner cores of the bubbles.")
 
-# --- FULL WIDTH TABBED INTERFACE ---
-tab1, tab2 = st.tabs(["📱 Native Mobile Camera (Best for Focus)", "📸 Quick Browser Scanner"])
+tab1, tab2 = st.tabs(["📱 Native Mobile Camera (Tap to focus)", "📸 Web Scanner"])
 
 with tab1:
-    st.write("### 📸 High-Quality Capture")
-    st.success("💡 **Tip for Mobile:** Tap **Browse files** below to use your native Camera app (enables **tap-to-focus** and **flash**).")
     upload_img = st.file_uploader("Take Photo or Upload Image", type=['jpg','png','jpeg'])
 
 with tab2:
-    st.write("### 🎥 Live Browser Scan")
-    st.warning("Web browsers block manual focus controls. If the image is blurry, please use the Native Mobile Camera tab instead.")
     camera_img = st.camera_input("Live Camera", label_visibility="collapsed")
 
 input_file = upload_img if upload_img is not None else camera_img
@@ -234,42 +202,37 @@ if input_file:
     img_np = np.array(img)
     img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     
-    with st.spinner("Analyzing OMR Sheet..."):
-        output = process_omr(img_np, align_mode=align_mode, debug=debug_mode, show_missed=show_missed)
-        
-        if output[0] is None:
-            data, count, processed_img, debug_img, status_msg = output
-            st.error(f"⚠️ **Evaluation Failed:** Found {count}/{EXPECTED_BUBBLES} bubbles. {status_msg}")
-            st.info("💡 **Fix it:** Look at the sidebar on the left and change the **Alignment Method** to something else, then try again.")
+    with st.spinner("Executing Ultra Engine Processing..."):
+        try:
+            output = process_omr_ultra(img_np, show_missed=show_missed)
             
-            st.markdown("### 🔍 Diagnostic View (What the AI Sees)")
-            st.image(cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB), use_container_width=True)
-            
-        else:
-            data, count, processed_img, debug_img, status_msg = output
-            pos = data['correct'] * CORRECT_PTS
-            neg = data['wrong'] * WRONG_PTS
-            total = pos - neg
-            
-            # --- SCORECARD ---
-            st.markdown("---")
-            st.markdown("### 📊 OFFICIAL SCORECARD")
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Correct", data['correct'], f"+{pos} pts")
-            m2.metric("Incorrect", data['wrong'], f"-{neg} pts")
-            m3.metric("Blank", data['blank'])
-            m4.metric("Double Marked", data['double'], help="Counted as incorrect")
-            m5.metric("FINAL SCORE", total)
-            st.markdown("---")
-            
-            # --- VISUAL VERIFICATION ---
-            col_img, col_legend = st.columns([3, 1])
-            with col_img:
-                st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), use_container_width=True)
-            with col_legend:
-                st.write("### Legend")
-                st.success("🟢 **Correct**")
-                st.error("🔴 **Incorrect**")
-                st.warning("🟡 **Double Bubble**")
-                if show_missed:
-                    st.info("🔵 **Missed Answer**")
+            if output[0] is None:
+                err_msg = output[1]
+                st.error(f"⚠️ **Scan Failed:** {err_msg}")
+            else:
+                data, processed_img, debug_img, _ = output
+                pos = data['correct'] * CORRECT_PTS
+                neg = data['wrong'] * WRONG_PTS
+                total = pos - neg
+                
+                # SCORECARD
+                st.markdown("---")
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Correct", data['correct'], f"+{pos}")
+                m2.metric("Incorrect", data['wrong'], f"-{neg}")
+                m3.metric("Blank", data['blank'])
+                m4.metric("Double Marked", data['double'])
+                m5.metric("FINAL SCORE", total)
+                st.markdown("---")
+                
+                col_res, col_diag = st.columns([1, 1])
+                with col_res:
+                    st.write("### 📝 Graded Sheet")
+                    st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+                with col_diag:
+                    st.write("### 🔍 AI Inner-Core Diagnostics")
+                    st.write("*(The purple dots show the exact center where the AI checked for ink)*")
+                    st.image(cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+                    
+        except Exception as e:
+            st.error(f"Critical Engine Failure: {str(e)}")
