@@ -25,7 +25,7 @@ ANS_KEY = {
     51: 0, 52: 1, 53: 1, 54: 3, 55: 1, 56: 2, 57: 0, 58: 1, 59: 1, 60: 1
 }
 
-def process_omr(image_np, debug=False):
+def process_omr(image_np, debug=False, show_missed=False):
     orig = image_np.copy()
     gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
     
@@ -53,7 +53,7 @@ def process_omr(image_np, debug=False):
         paper = gray
         color_paper = orig
 
-    # 2. Thresholding (Resizing is crucial for consistent bubble size)
+    # 2. Thresholding
     paper = imutils.resize(paper, height=1500)
     color_paper = imutils.resize(color_paper, height=1500)
     
@@ -68,19 +68,15 @@ def process_omr(image_np, debug=False):
     for c in cnts:
         (x, y, w, h) = cv2.boundingRect(c)
         ar = w / float(h)
-        # Relaxed constraints to catch bubbles even if slightly stretched by camera angle
         if 18 <= w <= 55 and 18 <= h <= 55 and 0.7 <= ar <= 1.3:
             bubbles.append(c)
 
-    # NOISE FILTER: If too many bubbles, keep only the most circular/correctly sized ones
     if len(bubbles) > EXPECTED_BUBBLES:
-        # Sort by circularity (w/h closest to 1.0)
         bubbles = sorted(bubbles, key=lambda c: abs(1.0 - (cv2.boundingRect(c)[2] / float(cv2.boundingRect(c)[3]))))
         bubbles = bubbles[:EXPECTED_BUBBLES]
 
-    # Debug Image Generation
     debug_img = color_paper.copy()
-    cv2.drawContours(debug_img, bubbles, -1, (255, 0, 255), 2) # Draw found bubbles in purple
+    cv2.drawContours(debug_img, bubbles, -1, (255, 0, 255), 2)
 
     if len(bubbles) != EXPECTED_BUBBLES:
         return None, len(bubbles), color_paper, debug_img, "Bubble count mismatch."
@@ -88,18 +84,15 @@ def process_omr(image_np, debug=False):
     # 4. Sorting & Grading
     try:
         bubbles = imutils_contours.sort_contours(bubbles, method="left-to-right")[0]
-        # Split into 3 columns of 80 bubbles (20 questions * 4 options each)
         cols = [bubbles[0:80], bubbles[80:160], bubbles[160:240]]
         
         results = {"correct": 0, "wrong": 0, "blank": 0, "double": 0}
         q_idx = 1
 
         for col in cols:
-            # Sort each column top-to-bottom
             col_cnts = imutils_contours.sort_contours(col, method="top-to-bottom")[0]
             
             for i in np.arange(0, len(col_cnts), 4):
-                # Sort the 4 bubbles in the row left-to-right (A, B, C, D)
                 row = imutils_contours.sort_contours(col_cnts[i:i+4], method="left-to-right")[0]
                 
                 pixel_counts = []
@@ -110,46 +103,54 @@ def process_omr(image_np, debug=False):
                     total = cv2.countNonZero(mask)
                     pixel_counts.append((total, j))
                 
-                # Sort by darkest bubble
                 pixel_counts.sort(key=lambda x: x[0], reverse=True)
                 
                 darkest_val, darkest_idx = pixel_counts[0]
                 second_darkest_val = pixel_counts[1][0]
-                
                 correct_ans = ANS_KEY.get(q_idx)
                 
-                # Grading Logic
+                # --- UPDATED GRADING LOGIC ---
                 if darkest_val < 300: 
-                    # If even the darkest bubble has less than 300 filled pixels, it's blank
+                    # BLANK
                     results["blank"] += 1
+                    if show_missed:
+                        cv2.drawContours(color_paper, [row[correct_ans]], -1, (255, 0, 0), 2)
+                        
                 elif second_darkest_val > (darkest_val * 0.75): 
-                    # If the 2nd darkest is at least 75% as dark as the 1st, it's a double mark
+                    # DOUBLE BUBBLED
                     results["double"] += 1
                     results["wrong"] += 1
                     cv2.drawContours(color_paper, [row[darkest_idx], row[pixel_counts[1][1]]], -1, (0, 255, 255), 3) # Yellow
+                    if show_missed:
+                        cv2.drawContours(color_paper, [row[correct_ans]], -1, (255, 0, 0), 2)
+                        
                 elif darkest_idx == correct_ans:
+                    # CORRECT
                     results["correct"] += 1
                     cv2.drawContours(color_paper, [row[darkest_idx]], -1, (0, 255, 0), 3) # Green
+                    
                 else:
+                    # WRONG
                     results["wrong"] += 1
-                    cv2.drawContours(color_paper, [row[darkest_idx]], -1, (0, 0, 255), 3) # Red
-                    cv2.drawContours(color_paper, [row[correct_ans]], -1, (255, 0, 0), 2) # Blue for correct answer
+                    cv2.drawContours(color_paper, [row[darkest_idx]], -1, (0, 0, 255), 3) # Red (Student's choice)
+                    if show_missed:
+                        cv2.drawContours(color_paper, [row[correct_ans]], -1, (255, 0, 0), 2) # Blue (Actual answer)
                 
                 q_idx += 1
 
         return results, len(bubbles), color_paper, debug_img, "Success"
 
     except Exception as e:
-        return None, len(bubbles), color_paper, debug_img, f"Sorting Error: The camera angle is too crooked to align the grid properly. ({str(e)})"
+        return None, len(bubbles), color_paper, debug_img, f"Sorting Error: The camera angle is too crooked. ({str(e)})"
 
 
 # --- UI ---
 st.title("📝 Yuva Gyan Mahotsav 2026 OMR Grader")
 
 with st.sidebar:
-    st.header("⚙️ Diagnostics")
-    debug_mode = st.toggle("View AI Diagnostics", value=True, help="Shows exactly which bubbles the AI is finding.")
-    st.info("💡 **Tips for perfect scanning:**\n\n1. Lay paper flat on a dark surface.\n2. Avoid harsh shadows or glare.\n3. Hold camera directly overhead.")
+    st.header("⚙️ Settings")
+    show_missed = st.toggle("Show Missed Answers (Blue)", value=False, help="If turned on, it draws a blue circle to show what the right answer was on mistakes.")
+    debug_mode = st.toggle("View AI Diagnostics", value=False, help="Shows exactly which bubbles the AI is finding.")
 
 camera_img = st.camera_input("Take a photo of the OMR sheet")
 upload_img = st.file_uploader("Or upload an image", type=['jpg','png','jpeg'])
@@ -162,14 +163,12 @@ if input_file:
     img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     
     with st.spinner("Grading..."):
-        data, count, processed_img, debug_img, status_msg = process_omr(img_np, debug=debug_mode)
+        data, count, processed_img, debug_img, status_msg = process_omr(img_np, debug=debug_mode, show_missed=show_missed)
         
         if data is None:
             st.error(f"⚠️ **Evaluation Failed:** Found {count}/{EXPECTED_BUBBLES} bubbles. {status_msg}")
-            
-            st.markdown("### 🔍 What the AI Sees (Diagnostic View)")
-            st.write("If you see fewer/more than 240 purple circles below, lighting or camera angle is the issue.")
-            st.image(cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+            if debug_mode:
+                st.image(cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB), use_container_width=True)
             
         else:
             pos = data['correct'] * CORRECT_PTS
@@ -182,7 +181,7 @@ if input_file:
             col1.metric("Correct", data['correct'], f"+{pos}")
             col2.metric("Incorrect", data['wrong'], f"-{neg}")
             col3.metric("Blank", data['blank'])
-            col4.metric("Double Marked", data['double'], help="Counted as incorrect")
+            col4.metric("Double Marked", data['double'])
             col5.metric("FINAL SCORE", total)
             st.markdown("---")
             
@@ -194,5 +193,6 @@ if input_file:
                 st.write("### Legend")
                 st.success("🟢 **Correct**")
                 st.error("🔴 **Incorrect**")
-                st.info("🔵 **Missed Answer**")
                 st.warning("🟡 **Double Bubble**")
+                if show_missed:
+                    st.info("🔵 **Missed Answer**")
