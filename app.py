@@ -8,7 +8,7 @@ import pandas as pd
 from PIL import Image
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Yuva Gyan Enterprise Grader", layout="wide", page_icon="🚀")
+st.set_page_config(page_title="Yuva Gyan Enterprise Grader", layout="wide", page_icon="🎯")
 
 # --- RULES & KEY ---
 CORRECT_PTS = 3
@@ -32,6 +32,7 @@ COLOR_BLUE = (255, 0, 0)
 COLOR_YELLOW = (0, 255, 255)
 
 def load_file_as_image(uploaded_file):
+    """Processes both Image and PDF files seamlessly."""
     if uploaded_file.name.lower().endswith('.pdf'):
         doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
         page = doc.load_page(0)
@@ -46,6 +47,7 @@ def load_file_as_image(uploaded_file):
         return cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
 def find_fiducials(gray):
+    """Locates the 4 corner alignment markers."""
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     enhanced = clahe.apply(gray)
     blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
@@ -79,14 +81,14 @@ def process_omr_enterprise(image_np, show_missed=False, crop_top=350, crop_botto
     
     corner_pts = find_fiducials(gray)
     if corner_pts is None:
-        return None, "Could not locate the 4 dark corner marks. Ensure the page is fully visible."
+        return None, "Alignment Failed: Could not locate the 4 dark corner marks. Ensure the full page is visible."
 
+    # Standardize image dimensions
     warped_gray = four_point_transform(gray, corner_pts)
     warped_color = four_point_transform(orig, corner_pts)
     warped_gray = cv2.resize(warped_gray, (1200, 1600))
     warped_color = cv2.resize(warped_color, (1200, 1600))
     
-    # Threshold strictly used for finding bubble outlines
     thresh = cv2.adaptiveThreshold(warped_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 11)
 
     slices = [
@@ -99,6 +101,7 @@ def process_omr_enterprise(image_np, show_missed=False, crop_top=350, crop_botto
     breakdown_data = [] 
     
     for s_idx, sl in enumerate(slices):
+        # 1. Isolate the target scanning zone using the sliding box coordinates
         slice_thresh = thresh[crop_top:crop_bottom, sl["x_start"]:sl["x_end"]]
         cnts, _ = cv2.findContours(slice_thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         bubbles = []
@@ -106,102 +109,100 @@ def process_omr_enterprise(image_np, show_missed=False, crop_top=350, crop_botto
         for c in cnts:
             x, y, w, h = cv2.boundingRect(c)
             ar = w / float(h)
-            # Generous bounding box to catch all bubbles perfectly
             if 12 <= w <= 65 and 12 <= h <= 65 and 0.5 <= ar <= 1.5:
                 bubbles.append((x + sl["x_start"], y + crop_top, w, h))
                 
-        # Group bubbles into strict rows based on Y-coordinates
+        # 2. Group bubbles robustly into rows
         bubbles = sorted(bubbles, key=lambda b: b[1])
         if len(bubbles) == 0:
-            return None, f"No bubbles found in Column {s_idx + 1}. Check crop sliders."
+            return None, f"No bubbles found in Column {s_idx + 1}. Check the Scanning Box boundaries."
             
         rows = []
         current_row = [bubbles[0]]
         for b in bubbles[1:]:
-            if abs(b[1] - current_row[-1][1]) < 20: # Belongs to same row
+            if abs(b[1] - current_row[-1][1]) < 20: 
                 current_row.append(b)
             else:
                 rows.append(sorted(current_row, key=lambda x: x[0]))
                 current_row = [b]
         rows.append(sorted(current_row, key=lambda x: x[0]))
 
-        # Filter strictly to rows containing exactly 4 options
+        # Filter out noise (only keep perfect rows of 4 options)
         valid_rows = [r for r in rows if len(r) == 4]
         
-        if len(valid_rows) != 20:
-            return None, f"Found {len(valid_rows)}/20 complete questions in Column {s_idx + 1}. Please adjust Top/Bottom Crop sliders."
+        expected_questions = sl["q_end"] - sl["q_start"] + 1
+        if len(valid_rows) != expected_questions:
+            return None, f"Found {len(valid_rows)}/{expected_questions} complete questions in Column {s_idx + 1}. Adjust the Scanning Box."
 
         current_q = sl["q_start"]
         
         for row in valid_rows:
             intensities = []
             for j, (bx, by, bw, bh) in enumerate(row):
-                # 200% Accuracy: Check Inner Core Grayscale Darkness
                 roi = warped_gray[by:by+bh, bx:bx+bw]
                 mask = np.zeros(roi.shape, dtype="uint8")
+                # 35% Inner Core Mask
                 cv2.circle(mask, (bw//2, bh//2), int(min(bw, bh) * 0.35), 255, -1)
                 
-                # Mean intensity: 0 is Pure Black (Filled), 255 is Pure White (Empty)
                 mean_intensity = cv2.mean(roi, mask=mask)[0]
                 intensities.append((mean_intensity, j, (bx, by, bw, bh)))
 
-            # Sort by darkest value first (lowest number)
             intensities.sort(key=lambda x: x[0])
             darkest_val, darkest_idx, darkest_box = intensities[0]
             second_val, second_idx, second_box = intensities[1]
             lightest_val = intensities[-1][0]
             
-            # Grayscale Contrast Ratio
             ratio_1 = darkest_val / lightest_val if lightest_val > 0 else 1.0
             ratio_2 = second_val / lightest_val if lightest_val > 0 else 1.0
             
             correct_ans_ai = ANS_KEY.get(current_q) - 1 
             
             def draw_box(b_box, color, thickness=3):
+                # Helper function to draw rectangles safely
                 cv2.rectangle(warped_color, (b_box[0], b_box[1]), (b_box[0]+b_box[2], b_box[1]+b_box[3]), color, thickness)
 
             status = ""
-            selected_human = OPTS[darkest_idx]
+            selected_human = OPTS.get(darkest_idx, "-")
 
-            # --- MUTUALLY EXCLUSIVE DRAWING LOGIC ---
+            # --- BUG-FREE MUTUALLY EXCLUSIVE GRADING LOGIC ---
             if ratio_1 > 0.82: 
-                # Blank (Darkest bubble is almost as bright as the lightest)
+                # CONDITION 1: BLANK
                 results["blank"] += 1
                 status = "Blank"
                 selected_human = "-"
                 if show_missed:
-                    draw_box(row[correct_ans_ai], COLOR_BLUE)
+                    draw_box(row[correct_ans_ai], COLOR_BLUE, 3)
                     
-            elif ratio_2 < 0.85 and (ratio_2 - ratio_1) < 0.12: 
-                # Double Marked (Both bubbles are dark, and very close in darkness)
+            elif ratio_2 < 0.85 and (ratio_2 - ratio_1) < 0.15: 
+                # CONDITION 2: DOUBLE MARKED
                 results["double"] += 1
                 results["wrong"] += 1
                 status = "Double Marked"
                 selected_human = "Multiple"
-                draw_box(darkest_box, COLOR_YELLOW)
-                draw_box(second_box, COLOR_YELLOW)
-                # Only draw blue if the correct answer wasn't one of the yellow ones
+                draw_box(darkest_box, COLOR_YELLOW, 3)
+                draw_box(second_box, COLOR_YELLOW, 3)
+                # Only draw blue if the correct answer wasn't one of the double marks
                 if show_missed and correct_ans_ai not in [darkest_idx, second_idx]:
-                    draw_box(row[correct_ans_ai], COLOR_BLUE)
+                    draw_box(row[correct_ans_ai], COLOR_BLUE, 3)
                     
             elif darkest_idx == correct_ans_ai:
-                # Correct Answer
+                # CONDITION 3: CORRECT
                 results["correct"] += 1
                 status = "Correct"
-                draw_box(darkest_box, COLOR_GREEN) # ONLY Green is drawn here
+                draw_box(darkest_box, COLOR_GREEN, 3) # STRICTLY draws ONLY Green.
                 
             else:
-                # Incorrect Answer
+                # CONDITION 4: INCORRECT
                 results["wrong"] += 1
                 status = "Incorrect"
-                draw_box(darkest_box, COLOR_RED) 
+                draw_box(darkest_box, COLOR_RED, 3) 
                 if show_missed:
-                    draw_box(row[correct_ans_ai], COLOR_BLUE) 
+                    draw_box(row[correct_ans_ai], COLOR_BLUE, 3)
             
             breakdown_data.append({
-                "Q No.": current_q,
+                "Q No.": str(current_q),
                 "Selected": selected_human,
-                "Correct": OPTS[correct_ans_ai],
+                "Correct": OPTS.get(correct_ans_ai, "-"),
                 "Status": status
             })
             
@@ -210,19 +211,27 @@ def process_omr_enterprise(image_np, show_missed=False, crop_top=350, crop_botto
     return results, warped_color, breakdown_data, "Success"
 
 # --- UI ---
-st.title("🚀 Yuva Gyan Enterprise Grader")
-st.markdown("Powered by Grayscale Contrast Engine & Strict Row Alignment.")
+st.title("🎯 Yuva Gyan Enterprise Grader")
+st.markdown("Powered by Grayscale Contrast Engine & Interactive Sliding Bounding Box.")
 
 with st.sidebar:
-    st.header("⚙️ Target Area Settings")
-    st.write("Adjust sliders to ensure the AI *only* scans the question area.")
-    crop_top = st.slider("Top Crop Boundary", min_value=100, max_value=800, value=350, step=10)
-    crop_bottom = st.slider("Bottom Crop Boundary", min_value=1200, max_value=1600, value=1550, step=10)
-    
-    st.divider()
-    st.header("⚙️ Output Settings")
+    st.header("⚙️ App Settings")
     show_missed = st.toggle("Show Missed Answers (Blue)", value=True, help="Draws blue on correct answers if student was wrong.")
 
+# --- THE "SLIDING BOX" INTERFACE ---
+st.markdown("### 📐 Step 1: Set the Scanning Box")
+st.markdown("Use the dual-slider below to move the top and bottom of the scanning box. Ensure it covers **only** the 60 questions, skipping headers and footers.")
+
+# This creates an interactive sliding window natively in Streamlit
+scan_zone = st.slider(
+    "Vertical Bounding Box", 
+    min_value=0, max_value=1600, 
+    value=(350, 1550), step=10, 
+    label_visibility="collapsed"
+)
+crop_top, crop_bottom = scan_zone
+
+st.markdown("### 📄 Step 2: Upload File")
 uploaded_file = st.file_uploader("Upload Scanned OMR Sheet (PDF or Image)", type=['pdf', 'jpg', 'png', 'jpeg'])
 
 if uploaded_file:
@@ -233,13 +242,15 @@ if uploaded_file:
             
             if output[0] is None:
                 st.error(f"⚠️ **Scan Failed:** {output[1]}")
-                st.info("Try adjusting the Crop Sliders on the left menu.")
             else:
                 data, processed_img, breakdown, _ = output
                 pos = data['correct'] * CORRECT_PTS
                 neg = data['wrong'] * WRONG_PTS
                 total = pos - neg
                 acc_percent = (data['correct'] / 60) * 100
+                
+                # Draw the green sliding box to show the user exactly what was scanned
+                cv2.rectangle(processed_img, (0, crop_top), (1200, crop_bottom), (0, 255, 0), 2)
                 
                 # --- DASHBOARD METRICS ---
                 st.markdown("### 📊 Official Scorecard")
@@ -262,6 +273,7 @@ if uploaded_file:
                     with col_leg:
                         st.write("### Legend")
                         st.info("🟢 Correct\n\n🔴 Incorrect\n\n🔵 Missed Answer\n\n🟡 Double Mark")
+                        st.success("🟩 Green Border shows your active Scanning Box.")
                         
                 with tab2:
                     st.write("#### Performance Analytics")
@@ -273,8 +285,6 @@ if uploaded_file:
                     
                 with tab3:
                     df = pd.DataFrame(breakdown)
-                    # Force 'Q No.' to be a string so it displays cleanly without commas
-                    df['Q No.'] = df['Q No.'].astype(str)
                     
                     def color_status(val):
                         if val == 'Correct': return 'color: #28a745; font-weight: bold;'
@@ -284,7 +294,6 @@ if uploaded_file:
                         
                     styled_df = df.style.map(color_status, subset=['Status'])
                     
-                    # hide_index=True instantly removes the "0, 1, 2" column on the left!
                     st.dataframe(styled_df, hide_index=True, use_container_width=True, height=600)
                     
                     csv = df.to_csv(index=False).encode('utf-8')
