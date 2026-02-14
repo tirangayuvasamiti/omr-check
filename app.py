@@ -7,12 +7,11 @@ import pandas as pd
 from PIL import Image
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Yuva Gyan Enterprise Grader", layout="wide", page_icon="📝")
+st.set_page_config(page_title="Yuva Gyan Precision Grader", layout="wide", page_icon="🎯")
 
-# --- RULES & ANSWER KEY ---
+# --- CONSTANTS ---
 CORRECT_PTS = 3
-WRONG_PTS = 1  # Subtracted
-
+WRONG_PTS = 1
 ANS_KEY = {
     1: 2, 2: 4, 3: 2, 4: 2, 5: 2, 6: 1, 7: 1, 8: 1, 9: 4, 10: 2,
     11: 1, 12: 1, 13: 4, 14: 1, 15: 2, 16: 1, 17: 4, 18: 2, 19: 2, 20: 3,
@@ -22,251 +21,218 @@ ANS_KEY = {
     51: 1, 52: 2, 53: 2, 54: 4, 55: 2, 56: 3, 57: 1, 58: 2, 59: 2, 60: 2
 }
 OPTS = {0: "A", 1: "B", 2: "C", 3: "D"}
+COLORS = {
+    'green': (0, 200, 0),    # Correct
+    'red': (0, 0, 255),      # Wrong
+    'blue': (255, 0, 0),     # Missed
+    'yellow': (0, 255, 255), # Double
+    'grid': (200, 200, 200)  # Visual Helper
+}
 
-# --- BGR COLORS FOR DRAWING ---
-COLOR_GREEN = (0, 220, 0)     # Correct
-COLOR_RED = (0, 0, 255)       # Incorrect
-COLOR_BLUE = (255, 0, 0)      # Missed
-COLOR_YELLOW = (0, 255, 255)  # Double Marked
-COLOR_GRID = (200, 200, 200)  # Debug Grid
-
-def load_document(uploaded_file):
+def load_image(uploaded_file):
     img = Image.open(uploaded_file).convert('RGB')
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 def get_document_corners(image):
-    """Finds the 4 paper corners to flatten the document."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    """
+    Robust Corner Finder: Uses dilation to connect broken lines.
+    Falls back to full image if corners are not found.
+    """
+    # Resize for processing speed
+    h_process = 1000
+    ratio = image.shape[0] / float(h_process)
+    process_img = imutils.resize(image, height=h_process)
+    
+    gray = cv2.cvtColor(process_img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edged = cv2.Canny(blurred, 75, 200)
+    
+    # DILATION: Critical for faint/broken border lines
+    kernel = np.ones((5,5), np.uint8)
+    edged = cv2.dilate(edged, kernel, iterations=2)
+    
     cnts = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cnts = imutils.grab_contours(cnts)
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
     
     doc_cnt = None
-    if len(cnts) > 0:
-        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
-        for c in cnts:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4 and cv2.contourArea(approx) > (image.shape[0] * image.shape[1] * 0.2):
-                doc_cnt = approx
-                break
-
+    for c in cnts:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            doc_cnt = approx
+            break
+            
     if doc_cnt is None:
-        h, w = image.shape[:2]
-        corners = np.array([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]], dtype="float32")
-        return corners
+        return np.array([[0, 0], [image.shape[1], 0], [image.shape[1], image.shape[0]], [0, image.shape[0]]], dtype="float32")
+    
+    return doc_cnt.reshape(4, 2) * ratio
 
-    return doc_cnt.reshape(4, 2)
-
-def process_omr_engine(image_np, show_missed=True):
-    # 1. Base Alignment
-    orig = imutils.resize(image_np, height=1500)
-    corner_pts = get_document_corners(orig)
-
-    # Standardize to an EXACT 1200x1600 matrix. 
-    # This makes all internal coordinates predictable via strict math.
-    warped_gray = four_point_transform(cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY), corner_pts)
-    warped_color = four_point_transform(orig, corner_pts)
-    warped_gray = cv2.resize(warped_gray, (1200, 1600))
-    warped_color = cv2.resize(warped_color, (1200, 1600))
+def process_roi_grader(image, show_missed=True):
+    # 1. Flatten the Page
+    corners = get_document_corners(image)
+    warped = four_point_transform(image, corners)
     
-    # =========================================================================
-    # ULTRA PRO MATH: DETERMINISTIC GRID CONFIGURATION
-    # Adjust these exact pixel coordinates based on the original template URL
-    # Canvas Size is exactly 1200 (X) by 1600 (Y)
-    # =========================================================================
+    # 2. Standardize Full Page Size (1200x1600)
+    # We do this to ensure our "Cut Coordinates" are always accurate
+    warped = cv2.resize(warped, (1200, 1600))
     
-    # Vertical Math (Y-Axis)
-    Y_START = 380            # Y-coordinate of the first row (Q1, Q21, Q41)
-    Y_END = 1520             # Y-coordinate of the last row (Q20, Q40, Q60)
-    NUM_ROWS = 20
-    Y_STEP = (Y_END - Y_START) / (NUM_ROWS - 1) # Mathematical gap between rows
+    # 3. ROI EXTRACTION (The "Surgical" Crop)
+    # We cut out the top header (Instructions) and bottom footer (Official Use)
+    # Based on the Yuva Gyan template:
+    # Top Cut: Y=360 (Just below "Correct: Wrong:")
+    # Bottom Cut: Y=1540 (Just above "For Official Use Only")
+    CROP_TOP = 360
+    CROP_BOTTOM = 1540
     
-    # Horizontal Math (X-Axis)
-    # The starting X-coordinate for Option 'A' in Columns 1, 2, and 3
-    COL_STARTS_X = [180, 560, 940] 
+    # Create the ROI image
+    roi_img = warped[CROP_TOP:CROP_BOTTOM, 0:1200]
+    roi_gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
     
-    # Distance between Option A, B, C, D
-    OPT_STEP_X = 55 
+    # 4. MATH GRID (Relative to the ROI, not the full page)
+    # Now (0,0) is the top-left of the cropped bubble zone.
+    # Total Height of ROI is approx 1180px
     
-    # Size of the bubble bounding box to extract
-    BUBBLE_W = 40
-    BUBBLE_H = 40
+    # Grid Calibration
+    ROWS = 20
+    COLS = 3
+    COL_X_START = [180, 560, 940]  # X coordinates for Col 1, 2, 3
+    ROW_Y_START = 20               # Start near the top of the crop
+    ROW_GAP = 58.5                 # Vertical distance between rows
+    OPT_GAP = 55                   # Horizontal distance between bubbles
+    BUBBLE_SIZE = 42
     
     results = {"correct": 0, "wrong": 0, "blank": 0, "double": 0}
-    breakdown_data = []
+    breakdown = []
+    
+    def draw_roi(box, color, thick=3):
+        cv2.rectangle(roi_img, (box[0], box[1]), (box[0]+box[2], box[1]+box[3]), color, thick)
 
-    # Helper function to draw boxes
-    def draw_box(b_box, color, thickness=3):
-        cv2.rectangle(warped_color, (b_box[0], b_box[1]), (b_box[0]+b_box[2], b_box[1]+b_box[3]), color, thickness)
-
-    # 2. Mathematical Extraction & Grading Loop
-    for q_idx in range(60):
-        q_number = q_idx + 1
+    # 5. Grading Loop
+    for q_abs in range(1, 61):
+        # Determine Grid Position
+        if q_abs <= 20:
+            col_idx, row_idx = 0, q_abs - 1
+        elif q_abs <= 40:
+            col_idx, row_idx = 1, q_abs - 21
+        else:
+            col_idx, row_idx = 2, q_abs - 41
+            
+        base_x = COL_X_START[col_idx]
+        base_y = int(ROW_Y_START + (row_idx * ROW_GAP))
         
-        # Determine column (0, 1, 2) and row (0 to 19) using modulo math
-        col_idx = q_idx // 20
-        row_idx = q_idx % 20
+        bubbles = []
+        scores = []
         
-        # Calculate exact Base (X, Y) for this question
-        base_x = COL_STARTS_X[col_idx]
-        base_y = int(Y_START + (row_idx * Y_STEP))
-        
-        # Calculate the 4 bubble boxes mathematically
-        row_boxes = []
-        fill_data = []
-        
-        for opt_idx in range(4):
-            bx = int(base_x + (opt_idx * OPT_STEP_X))
+        for i in range(4):
+            bx = base_x + (i * OPT_GAP)
             by = base_y
             
-            # Draw a faint gray box so you can visually verify the grid aligns perfectly
-            cv2.rectangle(warped_color, (bx, by), (bx+BUBBLE_W, by+BUBBLE_H), COLOR_GRID, 1)
+            # --- AI PIXEL DENSITY CHECK ---
+            # We focus on the center 40% of the bubble to avoid edge noise
+            # Thresholding handles the "Blue/Black Pen" requirement
+            cell = roi_gray[by:by+BUBBLE_SIZE, bx:bx+BUBBLE_SIZE]
+            mask = np.zeros(cell.shape, dtype="uint8")
+            cv2.circle(mask, (BUBBLE_SIZE//2, BUBBLE_SIZE//2), int(BUBBLE_SIZE*0.40), 255, -1)
             
-            box = (bx, by, BUBBLE_W, BUBBLE_H)
-            row_boxes.append(box)
+            mean_val = cv2.mean(cell, mask=mask)[0]
+            scores.append((mean_val, i))
+            bubbles.append((bx, by, BUBBLE_SIZE, BUBBLE_SIZE))
             
-            # Extract ROI mathematically (no contours needed!)
-            roi = warped_gray[by:by+BUBBLE_H, bx:bx+BUBBLE_W]
-            
-            # Calculate intensity
-            mask = np.zeros(roi.shape, dtype="uint8")
-            cv2.circle(mask, (BUBBLE_W//2, BUBBLE_H//2), int(min(BUBBLE_W, BUBBLE_H) * 0.40), 255, -1)
-            mean_intensity = cv2.mean(roi, mask=mask)[0] # 0 = Black, 255 = White
-            
-            fill_data.append((mean_intensity, opt_idx, box))
-            
-        # Determine darkest bubble
-        fill_data.sort(key=lambda x: x[0])
-        lightest_val = fill_data[-1][0]
-        
-        marked_indices = []
-        marked_boxes = []
-        
-        for data in fill_data:
-            intensity, idx, box = data
-            # Contrast threshold: Must be noticeably darker than the blank paper
-            if intensity < (lightest_val * 0.82):
-                marked_indices.append(idx)
-                marked_boxes.append(box)
+            # Draw Grid (Debug)
+            cv2.rectangle(roi_img, (bx, by), (bx+BUBBLE_SIZE, by+BUBBLE_SIZE), COLORS['grid'], 1)
 
-        correct_ans_ai = ANS_KEY.get(q_number) - 1 
+        # Sort: Darkest bubble first (lowest pixel value)
+        scores.sort(key=lambda x: x[0])
+        best_val, best_idx = scores[0]
+        lightest_val = scores[-1][0]
+        
+        # --- ROBUST DECISION LOGIC ---
+        # A mark is valid ONLY if it is < 82% brightness of the empty paper
+        marked = [idx for val, idx in scores if val < (lightest_val * 0.82)]
+        
+        correct_ans = ANS_KEY[q_abs] - 1
         status = ""
-        selected_human = "-"
-
-        # --- STRICT MUTUALLY EXCLUSIVE GRADING ---
-        if len(marked_indices) == 0:
-            results["blank"] += 1
-            status = "Blank"
-            if show_missed:
-                draw_box(row_boxes[correct_ans_ai], COLOR_BLUE, 2)
-                
-        elif len(marked_indices) > 1:
-            results["double"] += 1
-            results["wrong"] += 1
-            status = "Double Marked"
-            selected_human = "Multiple"
-            for box in marked_boxes:
-                draw_box(box, COLOR_YELLOW, 3)
-            if show_missed and correct_ans_ai not in marked_indices:
-                draw_box(row_boxes[correct_ans_ai], COLOR_BLUE, 2)
-                
-        elif len(marked_indices) == 1:
-            student_ans = marked_indices[0]
-            student_box = marked_boxes[0]
-            selected_human = OPTS.get(student_ans, "-")
-            
-            if student_ans == correct_ans_ai:
-                results["correct"] += 1
-                status = "Correct"
-                draw_box(student_box, COLOR_GREEN, 3) 
-            else:
-                results["wrong"] += 1
-                status = "Incorrect"
-                draw_box(student_box, COLOR_RED, 3) 
-                if show_missed:
-                    draw_box(row_boxes[correct_ans_ai], COLOR_BLUE, 2)
         
-        breakdown_data.append({
-            "Q No.": str(q_number),
-            "Selected": selected_human,
-            "Correct Answer": OPTS.get(correct_ans_ai, "-"),
-            "Status": status
-        })
+        if len(marked) == 0:
+            status = "Blank"
+            results['blank'] += 1
+            if show_missed:
+                draw_roi(bubbles[correct_ans], COLORS['blue'], 2)
+                
+        elif len(marked) > 1:
+            status = "Double"
+            results['double'] += 1
+            results['wrong'] += 1
+            for idx in marked:
+                draw_roi(bubbles[idx], COLORS['yellow'], 3)
+                
+        else:
+            student_ans = marked[0]
+            if student_ans == correct_ans:
+                status = "Correct"
+                results['correct'] += 1
+                draw_roi(bubbles[student_ans], COLORS['green'], 3)
+            else:
+                status = "Incorrect"
+                results['wrong'] += 1
+                draw_roi(bubbles[student_ans], COLORS['red'], 3)
+                if show_missed:
+                    draw_roi(bubbles[correct_ans], COLORS['blue'], 2)
+                    
+        breakdown.append({"Q": q_abs, "Status": status, "Marked": OPTS.get(marked[0], "-") if len(marked)==1 else "Multi/None"})
 
-    return results, warped_color, breakdown_data, "Success"
-
+    return results, roi_img, breakdown
 
 # --- STREAMLIT UI ---
-st.title("🏆 Mathematical OMR Grader")
-st.markdown("Fully deterministic grid-based pipeline for 60 Questions. 0% AI guessing.")
+st.title("🎯 Precision ROI Grader")
+st.markdown("**Scanning Zone:** Below 'INSTRUCTIONS' ➡ Above 'OFFICIAL USE ONLY'")
 
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    show_missed = st.toggle("Show Missed Answers (Blue)", value=True)
-    st.divider()
-    st.info("💡 **Math-Based Engine:** Bypasses unpredictable contour detection. Uses coordinate geometry locked to a 1200x1600 matrix.")
 
-uploaded_file = st.file_uploader("Upload OMR Document (JPG, PNG)", type=['jpg', 'png', 'jpeg'])
+
+col1, col2 = st.columns([1, 3])
+with col1:
+    st.write("### ⚙️ Settings")
+    show_missed = st.checkbox("Show Correct Answers", value=True)
+    st.info("This mode creates a 'Surgical Crop' of the bubble area to eliminate header/footer noise.")
+
+with col2:
+    uploaded_file = st.file_uploader("Upload OMR (JPG/PNG)", type=['jpg', 'png', 'jpeg'])
 
 if uploaded_file:
-    with st.spinner("Processing document..."):
+    with st.spinner("Isolating Bubble Zone & Grading..."):
         try:
-            img_np = load_document(uploaded_file)
-            output = process_omr_engine(img_np, show_missed=show_missed)
+            img = load_image(uploaded_file)
+            stats, processed_roi, logs = process_roi_grader(img, show_missed)
             
-            data, processed_img, breakdown, msg = output
+            # SCORING
+            score = (stats['correct'] * CORRECT_PTS) - (stats['wrong'] * WRONG_PTS)
             
-            pos = data['correct'] * CORRECT_PTS
-            neg = data['wrong'] * WRONG_PTS
-            total = pos - neg
-            acc_percent = (data['correct'] / 60) * 100
+            st.write("### 📊 Grading Report")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("✅ Correct", stats['correct'])
+            m2.metric("❌ Incorrect", stats['wrong'])
+            m3.metric("⚠️ Blank/Double", stats['blank'] + stats['double'])
+            m4.metric("🏆 Total Score", score)
             
-            st.markdown("### 📊 Official Scorecard")
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Correct", data['correct'], f"+{pos} pts")
-            m2.metric("Incorrect", data['wrong'], f"-{neg} pts")
-            m3.metric("Blank", data['blank'])
-            m4.metric("Double Marked", data['double'], help="Counts as Incorrect")
-            m5.metric("FINAL SCORE", total)
-            st.progress(acc_percent / 100, text=f"Overall Accuracy: {acc_percent:.1f}%")
-            st.markdown("---")
+            st.divider()
             
-            tab1, tab2, tab3 = st.tabs(["📝 Graded Sheet", "📈 Analytics", "⚙️ Data Table"])
+            t1, t2 = st.tabs(["🖼️ Scanned ROI View", "📝 Question Data"])
             
-            with tab1:
-                col_img, col_leg = st.columns([3, 1])
-                with col_img:
-                    st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), use_container_width=True)
-                with col_leg:
-                    st.write("### Color Key")
-                    st.success("🟩 **Correct**")
-                    st.error("🟥 **Incorrect**")
-                    st.info("🟦 **Missed Answer**")
-                    st.warning("🟨 **Double Mark**")
-                    st.write("⬜ **Gray Box**: Grid Calibration")
-                    
-            with tab2:
-                chart_data = pd.DataFrame({
-                    "Category": ["Correct", "Incorrect", "Blank/Double"],
-                    "Count": [data['correct'], data['wrong'], data['blank'] + data['double']]
-                })
-                st.bar_chart(chart_data, x="Category", y="Count", color="#2a9df4")
+            with t1:
+                st.write("**Visual Confirmation:** The image below is the *exact* cropped area the AI analyzed.")
+                st.image(processed_roi, channels="BGR", use_container_width=True)
                 
-            with tab3:
-                df = pd.DataFrame(breakdown)
-                def color_status(val):
-                    if val == 'Correct': return 'color: #28a745; font-weight: bold;'
-                    if val == 'Incorrect': return 'color: #dc3545; font-weight: bold;'
-                    if val == 'Double Marked': return 'color: #ffc107; font-weight: bold;'
-                    return 'color: gray;'
-                styled_df = df.style.map(color_status, subset=['Status'])
-                st.dataframe(styled_df, hide_index=True, use_container_width=True, height=600)
+            with t2:
+                df = pd.DataFrame(logs)
                 
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button(label="📥 Download CSV", data=csv, file_name="OMR_Results.csv", mime="text/csv")
+                def color_rows(row):
+                    s = row['Status']
+                    if s == 'Correct': return ['background-color: #d4edda'] * len(row)
+                    if s == 'Incorrect': return ['background-color: #f8d7da'] * len(row)
+                    return [''] * len(row)
+                
+                st.dataframe(df.style.apply(color_rows, axis=1), use_container_width=True, height=500)
                 
         except Exception as e:
-            st.error(f"Critical System Exception: {str(e)}")
-            st.exception(e)
+            st.error(f"Processing Error: {e}")
