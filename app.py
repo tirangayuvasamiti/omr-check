@@ -1,15 +1,18 @@
 import streamlit as st
 import cv2
 import numpy as np
+import imutils
+from imutils.perspective import four_point_transform
 import pandas as pd
 from PIL import Image
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Yuva Gyan Enterprise Grader", layout="wide", page_icon="📝")
 
-# --- GRADING CONSTANTS ---
+# --- RULES & ANSWER KEY ---
 CORRECT_PTS = 3
-WRONG_PTS = 1
+WRONG_PTS = 1  # Subtracted
+
 ANS_KEY = {
     1: 2, 2: 4, 3: 2, 4: 2, 5: 2, 6: 1, 7: 1, 8: 1, 9: 4, 10: 2,
     11: 1, 12: 1, 13: 4, 14: 1, 15: 2, 16: 1, 17: 4, 18: 2, 19: 2, 20: 3,
@@ -20,303 +23,250 @@ ANS_KEY = {
 }
 OPTS = {0: "A", 1: "B", 2: "C", 3: "D"}
 
-# --- UTILITY FUNCTIONS ---
+# --- BGR COLORS FOR DRAWING ---
+COLOR_GREEN = (0, 220, 0)     # Correct
+COLOR_RED = (0, 0, 255)       # Incorrect
+COLOR_BLUE = (255, 0, 0)      # Missed
+COLOR_YELLOW = (0, 255, 255)  # Double Marked
+COLOR_GRID = (200, 200, 200)  # Debug Grid
 
-def order_points(pts):
-    """
-    Orders coordinates: top-left, top-right, bottom-right, bottom-left.
-    Essential for correct perspective wrapping.
-    """
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # Top-left
-    rect[2] = pts[np.argmax(s)]  # Bottom-right
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # Top-right
-    rect[3] = pts[np.argmax(diff)]  # Bottom-left
-    return rect
+def load_document(uploaded_file):
+    img = Image.open(uploaded_file).convert('RGB')
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-def four_point_transform(image, pts):
-    """
-    Mathematically flattens the image to a 'bird's eye view'.
-    """
-    rect = order_points(pts)
-    (tl, tr, br, bl) = rect
-
-    # Compute width of new image
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    maxWidth = max(int(widthA), int(widthB))
-
-    # Compute height of new image
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    maxHeight = max(int(heightA), int(heightB))
-
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
-
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-    return warped
-
-def sort_contours(cnts, method="left-to-right"):
-    """
-    Sorts contours based on spatial coordinates.
-    """
-    reverse = False
-    i = 0
-    if method == "right-to-left" or method == "bottom-to-top":
-        reverse = True
-    if method == "top-to-bottom" or method == "bottom-to-top":
-        i = 1
-    
-    boundingBoxes = [cv2.boundingRect(c) for c in cnts]
-    (cnts, boundingBoxes) = zip(*sorted(zip(cnts, boundingBoxes),
-                                        key=lambda b: b[1][i], reverse=reverse))
-    return (cnts, boundingBoxes)
-
-# --- CORE PIPELINE ---
-
-def process_omr(image_file, show_missed=True):
-    # 1. Load & Preprocess
-    img_pil = Image.open(image_file).convert('RGB')
-    image = np.array(img_pil)
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    
-    # Resize for consistent processing
-    h_orig, w_orig = image.shape[:2]
-    # We maintain aspect ratio but ensure it's large enough for contour detection
-    scaling_factor = 1600 / h_orig
-    image = cv2.resize(image, (int(w_orig * scaling_factor), 1600))
-    
+def get_document_corners(image):
+    """Finds the 4 paper corners to flatten the document."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edged = cv2.Canny(blurred, 75, 200)
-
-    # 2. Find Document Corners (The Paper)
     cnts = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = cnts[0] if len(cnts) == 2 else cnts[1]
-    docCnt = None
-
+    cnts = imutils.grab_contours(cnts)
+    
+    doc_cnt = None
     if len(cnts) > 0:
         cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
         for c in cnts:
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4:
-                docCnt = approx
+            if len(approx) == 4 and cv2.contourArea(approx) > (image.shape[0] * image.shape[1] * 0.2):
+                doc_cnt = approx
                 break
 
-    # Fallback to image corners if no paper edge found
-    if docCnt is None:
+    if doc_cnt is None:
         h, w = image.shape[:2]
-        docCnt = np.array([[0, 0], [w, 0], [w, h], [0, h]])
+        corners = np.array([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]], dtype="float32")
+        return corners
 
-    # 3. Perspective Transform (Flatten)
-    paper = four_point_transform(image, docCnt.reshape(4, 2))
-    warped_gray = four_point_transform(gray, docCnt.reshape(4, 2))
+    return doc_cnt.reshape(4, 2)
+
+def process_omr_engine(image_np, show_missed=True):
+    # 1. Base Alignment
+    orig = imutils.resize(image_np, height=1500)
+    corner_pts = get_document_corners(orig)
+
+    # Standardize to an EXACT 1200x1600 matrix. 
+    # This makes all internal coordinates predictable via strict math.
+    warped_gray = four_point_transform(cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY), corner_pts)
+    warped_color = four_point_transform(orig, corner_pts)
+    warped_gray = cv2.resize(warped_gray, (1200, 1600))
+    warped_color = cv2.resize(warped_color, (1200, 1600))
     
-    # 4. Bubble Detection
-    # Otsu's thresholding automatically finds the best separation between ink and paper
-    thresh = cv2.threshold(warped_gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+    # =========================================================================
+    # ULTRA PRO MATH: DETERMINISTIC GRID CONFIGURATION
+    # Adjust these exact pixel coordinates based on the original template URL
+    # Canvas Size is exactly 1200 (X) by 1600 (Y)
+    # =========================================================================
     
-    cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = cnts[0] if len(cnts) == 2 else cnts[1]
+    # Vertical Math (Y-Axis)
+    Y_START = 380            # Y-coordinate of the first row (Q1, Q21, Q41)
+    Y_END = 1520             # Y-coordinate of the last row (Q20, Q40, Q60)
+    NUM_ROWS = 20
+    Y_STEP = (Y_END - Y_START) / (NUM_ROWS - 1) # Mathematical gap between rows
     
-    questionCnts = []
-    # Heuristics for the provided OMR Layout
-    # Based on standard A4 OMR, bubbles are small circles.
-    paper_h, paper_w = paper.shape[:2]
-    min_area = (paper_w * paper_h) * 0.0001 # approx size of a bubble
-    max_area = (paper_w * paper_h) * 0.002
+    # Horizontal Math (X-Axis)
+    # The starting X-coordinate for Option 'A' in Columns 1, 2, and 3
+    COL_STARTS_X = [180, 560, 940] 
     
-    for c in cnts:
-        (x, y, w, h) = cv2.boundingRect(c)
-        ar = w / float(h)
+    # Distance between Option A, B, C, D
+    OPT_STEP_X = 55 
+    
+    # Size of the bubble bounding box to extract
+    BUBBLE_W = 40
+    BUBBLE_H = 40
+    
+    results = {"correct": 0, "wrong": 0, "blank": 0, "double": 0}
+    breakdown_data = []
+
+    # Helper function to draw boxes
+    def draw_box(b_box, color, thickness=3):
+        cv2.rectangle(warped_color, (b_box[0], b_box[1]), (b_box[0]+b_box[2], b_box[1]+b_box[3]), color, thickness)
+
+    # 2. Mathematical Extraction & Grading Loop
+    for q_idx in range(60):
+        q_number = q_idx + 1
         
-        # Filter: Aspect ratio ~1.0 (Square/Circle) and size check
-        if w >= 18 and h >= 18 and 0.8 <= ar <= 1.2:
-            if min_area < cv2.contourArea(c) < max_area:
-                # IMPORTANT: Exclude the top header (Roll No/Test ID)
-                # In standard OMRs, questions usually start after the top 20%
-                if y > paper_h * 0.20: 
-                    questionCnts.append(c)
-
-    # 5. Grid Validation
-    # We expect exactly 60 Questions * 4 Options = 240 Bubbles.
-    # If we find slightly more, we take the 240 most "circular" ones.
-    if len(questionCnts) != 240:
-        # Emergency heuristic: sort by y position (top-down) and take the most relevant ones
-        # or show error.
-        if len(questionCnts) > 240:
-             # Sort by Y position to roughly keep structure, but this is risky without exact match.
-             # Better to sort by Area deviation from median area
-             areas = [cv2.contourArea(c) for c in questionCnts]
-             median_area = np.median(areas)
-             # Keep contours closest to median area
-             questionCnts = sorted(questionCnts, key=lambda c: abs(cv2.contourArea(c) - median_area))[:240]
-        else:
-            return None, paper, None, f"Error: Detected {len(questionCnts)} bubbles. Expected 240. Ensure lighting is even."
-
-    # 6. Sorting Logic (The Math Part)
-    # Sort top-to-bottom? No, OMRs usually have columns.
-    # Strategy: Sort all by X coordinate first to separate the 3 columns.
-    
-    questionCnts = sort_contours(questionCnts, method="left-to-right")[0]
-    
-    # Split into 3 columns (80 bubbles each)
-    col_chunks = [questionCnts[i:i + 80] for i in range(0, 240, 80)]
-    
-    grading_results = {"correct": 0, "wrong": 0, "blank": 0, "double": 0}
-    breakdown = []
-    global_q_idx = 1
-    
-    for col in col_chunks:
-        # Within a column, sort Top-to-Bottom (Rows)
-        col = sort_contours(col, method="top-to-bottom")[0]
+        # Determine column (0, 1, 2) and row (0 to 19) using modulo math
+        col_idx = q_idx // 20
+        row_idx = q_idx % 20
         
-        # Process rows (4 bubbles per row)
-        for i in range(0, 80, 4):
-            row = col[i:i+4]
-            # Sort Row Left-to-Right (A, B, C, D)
-            row = sort_contours(row, method="left-to-right")[0]
+        # Calculate exact Base (X, Y) for this question
+        base_x = COL_STARTS_X[col_idx]
+        base_y = int(Y_START + (row_idx * Y_STEP))
+        
+        # Calculate the 4 bubble boxes mathematically
+        row_boxes = []
+        fill_data = []
+        
+        for opt_idx in range(4):
+            bx = int(base_x + (opt_idx * OPT_STEP_X))
+            by = base_y
             
-            # Identify the marked bubble
-            bubbled = None
-            detected_indices = []
+            # Draw a faint gray box so you can visually verify the grid aligns perfectly
+            cv2.rectangle(warped_color, (bx, by), (bx+BUBBLE_W, by+BUBBLE_H), COLOR_GRID, 1)
             
-            # Local thresholding for marking detection
-            fill_values = []
+            box = (bx, by, BUBBLE_W, BUBBLE_H)
+            row_boxes.append(box)
             
-            for (j, c) in enumerate(row):
-                mask = np.zeros(thresh.shape, dtype="uint8")
-                cv2.drawContours(mask, [c], -1, 255, -1)
+            # Extract ROI mathematically (no contours needed!)
+            roi = warped_gray[by:by+BUBBLE_H, bx:bx+BUBBLE_W]
+            
+            # Calculate intensity
+            mask = np.zeros(roi.shape, dtype="uint8")
+            cv2.circle(mask, (BUBBLE_W//2, BUBBLE_H//2), int(min(BUBBLE_W, BUBBLE_H) * 0.40), 255, -1)
+            mean_intensity = cv2.mean(roi, mask=mask)[0] # 0 = Black, 255 = White
+            
+            fill_data.append((mean_intensity, opt_idx, box))
+            
+        # Determine darkest bubble
+        fill_data.sort(key=lambda x: x[0])
+        lightest_val = fill_data[-1][0]
+        
+        marked_indices = []
+        marked_boxes = []
+        
+        for data in fill_data:
+            intensity, idx, box = data
+            # Contrast threshold: Must be noticeably darker than the blank paper
+            if intensity < (lightest_val * 0.82):
+                marked_indices.append(idx)
+                marked_boxes.append(box)
+
+        correct_ans_ai = ANS_KEY.get(q_number) - 1 
+        status = ""
+        selected_human = "-"
+
+        # --- STRICT MUTUALLY EXCLUSIVE GRADING ---
+        if len(marked_indices) == 0:
+            results["blank"] += 1
+            status = "Blank"
+            if show_missed:
+                draw_box(row_boxes[correct_ans_ai], COLOR_BLUE, 2)
                 
-                # Apply mask to thresholded image to count white pixels (ink)
-                mask = cv2.bitwise_and(thresh, thresh, mask=mask)
-                total = cv2.countNonZero(mask)
-                fill_values.append((total, j, c))
+        elif len(marked_indices) > 1:
+            results["double"] += 1
+            results["wrong"] += 1
+            status = "Double Marked"
+            selected_human = "Multiple"
+            for box in marked_boxes:
+                draw_box(box, COLOR_YELLOW, 3)
+            if show_missed and correct_ans_ai not in marked_indices:
+                draw_box(row_boxes[correct_ans_ai], COLOR_BLUE, 2)
+                
+        elif len(marked_indices) == 1:
+            student_ans = marked_indices[0]
+            student_box = marked_boxes[0]
+            selected_human = OPTS.get(student_ans, "-")
             
-            # Dynamic threshold for "marked": Must be > 50% of the max filled bubble in this row
-            # AND absolute pixel count must be significant.
-            fill_values.sort(key=lambda x: x[0], reverse=True)
-            max_fill = fill_values[0][0]
-            
-            # Threshold: bubble is marked if it has > 500 pixels (tuned for 1600px height)
-            # and is at least 85% as dark as the darkest bubble
-            for (fill, idx, cnt) in fill_values:
-                if fill > 400 and fill > (max_fill * 0.9): 
-                    detected_indices.append(idx)
-
-            correct_idx = ANS_KEY.get(global_q_idx) - 1
-            status = ""
-            selected_txt = ""
-
-            # Drawing Colors (BGR)
-            COLOR_CORRECT = (0, 255, 0)
-            COLOR_WRONG = (0, 0, 255) # Red
-            COLOR_MISSED = (255, 0, 0) # Blue (as requested)
-            
-            (x, y, w, h) = cv2.boundingRect(row[correct_idx])
-
-            if len(detected_indices) == 0:
-                grading_results["blank"] += 1
-                status = "Blank"
-                selected_txt = "-"
-                if show_missed:
-                    cv2.rectangle(paper, (x, y), (x+w, y+h), COLOR_MISSED, 2)
-                    
-            elif len(detected_indices) > 1:
-                grading_results["double"] += 1
-                grading_results["wrong"] += 1
-                status = "Double"
-                selected_txt = "Multi"
-                for idx in detected_indices:
-                    (bx, by, bw, bh) = cv2.boundingRect(row[idx])
-                    cv2.rectangle(paper, (bx, by), (bx+bw, by+bh), (0, 255, 255), 2) # Yellow for double
-                if show_missed:
-                    cv2.rectangle(paper, (x, y), (x+w, y+h), COLOR_MISSED, 2)
-                    
+            if student_ans == correct_ans_ai:
+                results["correct"] += 1
+                status = "Correct"
+                draw_box(student_box, COLOR_GREEN, 3) 
             else:
-                k = detected_indices[0]
-                selected_txt = OPTS[k]
-                (bx, by, bw, bh) = cv2.boundingRect(row[k])
-                
-                if k == correct_idx:
-                    grading_results["correct"] += 1
-                    status = "Correct"
-                    cv2.rectangle(paper, (bx, by), (bx+bw, by+bh), COLOR_CORRECT, 3)
-                else:
-                    grading_results["wrong"] += 1
-                    status = "Incorrect"
-                    cv2.rectangle(paper, (bx, by), (bx+bw, by+bh), COLOR_WRONG, 3)
-                    if show_missed:
-                         cv2.rectangle(paper, (x, y), (x+w, y+h), COLOR_MISSED, 2)
-
-            breakdown.append({
-                "Q": global_q_idx,
-                "Correct": OPTS[correct_idx],
-                "Marked": selected_txt,
-                "Status": status
-            })
-            global_q_idx += 1
-
-    return grading_results, paper, breakdown, "Success"
-
-# --- UI LOGIC ---
-
-st.sidebar.title("⚙️ Grader Settings")
-st.sidebar.markdown("""
-**Grading Rules:**
-* Correct: +3
-* Wrong: -1
-* Blank: 0
-""")
-show_missed = st.sidebar.checkbox("Highlight Missed Answers (Blue)", value=True)
-
-st.title("🏆 Yuva Gyan Enterprise Grader")
-st.markdown("Automated 60-Question OMR Processor (Math-Based)")
-
-uploaded_file = st.file_uploader("Upload OMR Sheet (Image)", type=['jpg', 'png', 'jpeg'])
-
-if uploaded_file is not None:
-    with st.spinner("Processing Geometry & Calculating Scores..."):
-        results, img_out, data, msg = process_omr(uploaded_file, show_missed)
+                results["wrong"] += 1
+                status = "Incorrect"
+                draw_box(student_box, COLOR_RED, 3) 
+                if show_missed:
+                    draw_box(row_boxes[correct_ans_ai], COLOR_BLUE, 2)
         
-        if results is None:
-            st.error(msg)
-            st.image(img_out, caption="Debug View (Paper Detection)", use_container_width=True)
-        else:
-            # Calc Score
-            score = (results['correct'] * CORRECT_PTS) - (results['wrong'] * WRONG_PTS)
-            acc = (results['correct'] / 60) * 100
+        breakdown_data.append({
+            "Q No.": str(q_number),
+            "Selected": selected_human,
+            "Correct Answer": OPTS.get(correct_ans_ai, "-"),
+            "Status": status
+        })
+
+    return results, warped_color, breakdown_data, "Success"
+
+
+# --- STREAMLIT UI ---
+st.title("🏆 Mathematical OMR Grader")
+st.markdown("Fully deterministic grid-based pipeline for 60 Questions. 0% AI guessing.")
+
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    show_missed = st.toggle("Show Missed Answers (Blue)", value=True)
+    st.divider()
+    st.info("💡 **Math-Based Engine:** Bypasses unpredictable contour detection. Uses coordinate geometry locked to a 1200x1600 matrix.")
+
+uploaded_file = st.file_uploader("Upload OMR Document (JPG, PNG)", type=['jpg', 'png', 'jpeg'])
+
+if uploaded_file:
+    with st.spinner("Processing document..."):
+        try:
+            img_np = load_document(uploaded_file)
+            output = process_omr_engine(img_np, show_missed=show_missed)
             
-            # 1. Metrics
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Final Score", score)
-            c2.metric("Accuracy", f"{acc:.1f}%")
-            c3.metric("Correct", results['correct'])
-            c4.metric("Incorrect / Double", results['wrong'])
+            data, processed_img, breakdown, msg = output
             
-            # 2. Main Visual
-            st.image(img_out, caption="Graded OMR Sheet", use_container_width=True)
+            pos = data['correct'] * CORRECT_PTS
+            neg = data['wrong'] * WRONG_PTS
+            total = pos - neg
+            acc_percent = (data['correct'] / 60) * 100
             
-            # 3. Data
-            with st.expander("Detailed Question Breakdown"):
-                df = pd.DataFrame(data)
+            st.markdown("### 📊 Official Scorecard")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Correct", data['correct'], f"+{pos} pts")
+            m2.metric("Incorrect", data['wrong'], f"-{neg} pts")
+            m3.metric("Blank", data['blank'])
+            m4.metric("Double Marked", data['double'], help="Counts as Incorrect")
+            m5.metric("FINAL SCORE", total)
+            st.progress(acc_percent / 100, text=f"Overall Accuracy: {acc_percent:.1f}%")
+            st.markdown("---")
+            
+            tab1, tab2, tab3 = st.tabs(["📝 Graded Sheet", "📈 Analytics", "⚙️ Data Table"])
+            
+            with tab1:
+                col_img, col_leg = st.columns([3, 1])
+                with col_img:
+                    st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+                with col_leg:
+                    st.write("### Color Key")
+                    st.success("🟩 **Correct**")
+                    st.error("🟥 **Incorrect**")
+                    st.info("🟦 **Missed Answer**")
+                    st.warning("🟨 **Double Mark**")
+                    st.write("⬜ **Gray Box**: Grid Calibration")
+                    
+            with tab2:
+                chart_data = pd.DataFrame({
+                    "Category": ["Correct", "Incorrect", "Blank/Double"],
+                    "Count": [data['correct'], data['wrong'], data['blank'] + data['double']]
+                })
+                st.bar_chart(chart_data, x="Category", y="Count", color="#2a9df4")
                 
-                def highlight_status(val):
-                    color = 'black'
-                    if val == 'Correct': color = 'green'
-                    elif val == 'Incorrect': color = 'red'
-                    elif val == 'Double': color = 'orange'
-                    return f'color: {color}; font-weight: bold'
-                
-                st.dataframe(df.style.map(highlight_status, subset=['Status']), use_container_width=True)
+            with tab3:
+                df = pd.DataFrame(breakdown)
+                def color_status(val):
+                    if val == 'Correct': return 'color: #28a745; font-weight: bold;'
+                    if val == 'Incorrect': return 'color: #dc3545; font-weight: bold;'
+                    if val == 'Double Marked': return 'color: #ffc107; font-weight: bold;'
+                    return 'color: gray;'
+                styled_df = df.style.map(color_status, subset=['Status'])
+                st.dataframe(styled_df, hide_index=True, use_container_width=True, height=600)
                 
                 csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button("Download CSV", csv, "omr_report.csv", "text/csv")
+                st.download_button(label="📥 Download CSV", data=csv, file_name="OMR_Results.csv", mime="text/csv")
+                
+        except Exception as e:
+            st.error(f"Critical System Exception: {str(e)}")
+            st.exception(e)
