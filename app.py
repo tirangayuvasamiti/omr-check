@@ -14,15 +14,15 @@ CORRECT_PTS = 3
 WRONG_PTS = 1  # Subtracted
 EXPECTED_BUBBLES = 240
 
-# --- VERIFIED ANSWER KEY FROM PDF ---
-# Format: A=0, B=1, C=2, D=3
+# --- VERIFIED ANSWER KEY ---
+# NORMAL FORMAT: A=1, B=2, C=3, D=4
 ANS_KEY = {
-    1: 1, 2: 3, 3: 1, 4: 1, 5: 1, 6: 0, 7: 0, 8: 0, 9: 3, 10: 1,
-    11: 0, 12: 0, 13: 3, 14: 0, 15: 1, 16: 0, 17: 3, 18: 1, 19: 1, 20: 2,
-    21: 3, 22: 1, 23: 0, 24: 1, 25: 3, 26: 0, 27: 2, 28: 3, 29: 3, 30: 2,
-    31: 0, 32: 2, 33: 1, 34: 1, 35: 2, 36: 1, 37: 3, 38: 2, 39: 0, 40: 3,
-    41: 1, 42: 0, 43: 3, 44: 2, 45: 1, 46: 2, 47: 0, 48: 0, 49: 0, 50: 0,
-    51: 0, 52: 1, 53: 1, 54: 3, 55: 1, 56: 2, 57: 0, 58: 1, 59: 1, 60: 1
+    1: 2, 2: 4, 3: 2, 4: 2, 5: 2, 6: 1, 7: 1, 8: 1, 9: 4, 10: 2,
+    11: 1, 12: 1, 13: 4, 14: 1, 15: 2, 16: 1, 17: 4, 18: 2, 19: 2, 20: 3,
+    21: 4, 22: 2, 23: 1, 24: 2, 25: 4, 26: 1, 27: 3, 28: 4, 29: 4, 30: 3,
+    31: 1, 32: 3, 33: 2, 34: 2, 35: 3, 36: 2, 37: 4, 38: 3, 39: 1, 40: 4,
+    41: 2, 42: 1, 43: 4, 44: 3, 45: 2, 46: 3, 47: 1, 48: 1, 49: 1, 50: 1,
+    51: 1, 52: 2, 53: 2, 54: 4, 55: 2, 56: 3, 57: 1, 58: 2, 59: 2, 60: 2
 }
 
 def process_omr(image_np, debug=False, show_missed=False):
@@ -111,14 +111,17 @@ def process_omr(image_np, debug=False, show_missed=False):
                 
                 darkest_val, darkest_idx = pixel_counts[0]
                 second_darkest_val = pixel_counts[1][0]
+                
+                # Get correct answer in Normal Format (1-4) and convert to AI Format (0-3)
                 correct_ans = ANS_KEY.get(q_idx)
+                correct_ans_idx = correct_ans - 1 
                 
                 # --- GRADING LOGIC ---
                 if darkest_val < 300: 
                     # BLANK
                     results["blank"] += 1
                     if show_missed:
-                        cv2.drawContours(color_paper, [row[correct_ans]], -1, (255, 0, 0), 2)
+                        cv2.drawContours(color_paper, [row[correct_ans_idx]], -1, (255, 0, 0), 2)
                         
                 elif second_darkest_val > (darkest_val * 0.75): 
                     # DOUBLE BUBBLED
@@ -126,9 +129,9 @@ def process_omr(image_np, debug=False, show_missed=False):
                     results["wrong"] += 1
                     cv2.drawContours(color_paper, [row[darkest_idx], row[pixel_counts[1][1]]], -1, (0, 255, 255), 3) # Yellow
                     if show_missed:
-                        cv2.drawContours(color_paper, [row[correct_ans]], -1, (255, 0, 0), 2)
+                        cv2.drawContours(color_paper, [row[correct_ans_idx]], -1, (255, 0, 0), 2)
                         
-                elif darkest_idx == correct_ans:
+                elif darkest_idx == correct_ans_idx:
                     # CORRECT
                     results["correct"] += 1
                     cv2.drawContours(color_paper, [row[darkest_idx]], -1, (0, 255, 0), 3) # Green
@@ -138,7 +141,7 @@ def process_omr(image_np, debug=False, show_missed=False):
                     results["wrong"] += 1
                     cv2.drawContours(color_paper, [row[darkest_idx]], -1, (0, 0, 255), 3) # Red 
                     if show_missed:
-                        cv2.drawContours(color_paper, [row[correct_ans]], -1, (255, 0, 0), 2) # Blue 
+                        cv2.drawContours(color_paper, [row[correct_ans_idx]], -1, (255, 0, 0), 2) # Blue 
                 
                 q_idx += 1
 
@@ -159,13 +162,20 @@ with st.sidebar:
     st.markdown("---")
     st.info("💡 **Tips for perfect scanning:**\n\n1. Lay paper flat on a dark surface.\n2. Avoid harsh shadows or glare.\n3. Hold camera directly overhead.")
 
-col1, col2 = st.columns(2)
-with col1:
-    camera_img = st.camera_input("Take a photo of the OMR sheet")
-with col2:
-    upload_img = st.file_uploader("Or upload an image", type=['jpg','png','jpeg'])
+# --- FULL WIDTH TABBED INTERFACE ---
+tab1, tab2 = st.tabs(["📱 Native Mobile Camera (Best for Focus)", "📸 Quick Browser Scanner"])
 
-input_file = camera_img if camera_img else upload_img
+with tab1:
+    st.write("### 📸 High-Quality Capture")
+    st.success("💡 **Tip for Mobile:** Tap **Browse files** below. Your phone will let you use your native Camera app so you can **tap-to-focus** and use the **flash** before grading!")
+    upload_img = st.file_uploader("Take Photo or Upload Image", type=['jpg','png','jpeg'])
+
+with tab2:
+    st.write("### 🎥 Live Browser Scan")
+    st.warning("Web browsers block manual focus controls. If the image is blurry, please use the Native Mobile Camera tab instead.")
+    camera_img = st.camera_input("Live Camera", label_visibility="collapsed")
+
+input_file = upload_img if upload_img is not None else camera_img
 
 if input_file:
     img = Image.open(input_file).convert('RGB')
