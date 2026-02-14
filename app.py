@@ -15,7 +15,7 @@ st.set_page_config(page_title="Yuva Gyan AI Vision Grader", layout="wide")
 ANS_KEY = {
     1: 2, 2: 4, 3: 2, 4: 2, 5: 2, 6: 1, 7: 1, 8: 1, 9: 4, 10: 2,
     11: 1, 12: 1, 13: 4, 14: 1, 15: 2, 16: 1, 17: 4, 18: 2, 19: 2, 20: 3,
-    21: 4, 22: 2, 23: 1, 24: 2, 25: 4, 26: 1, 27: 3, 28: 4, 29: 4, 30: 3,
+    21: 4, 22: 2, 23: 1, 24: 2, 25: 3, 26: 1, 27: 3, 28: 4, 29: 4, 30: 3,
     31: 1, 32: 3, 33: 2, 34: 2, 35: 3, 36: 2, 37: 4, 38: 3, 39: 1, 40: 4,
     41: 2, 42: 1, 43: 4, 44: 3, 45: 2, 46: 3, 47: 1, 48: 1, 49: 1, 50: 1,
     51: 1, 52: 2, 53: 2, 54: 4, 55: 2, 56: 3, 57: 1, 58: 2, 59: 2, 60: 2
@@ -433,3 +433,4 @@ if uploaded:
         st.dataframe(df, use_container_width=True)
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", data=csv, file_name="omr_logs.csv", mime="text/csv")
+
