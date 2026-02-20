@@ -315,12 +315,14 @@ class OMREngine:
     def cluster_bubbles_grid(self, features: list, img_shape: tuple) -> dict:
         """
         Groups utilizing the Machine Reading Squares printed to the left of each question.
+        Ignores question text sitting between the square and the bubbles.
         """
         if not features: return {}
 
         H, W = img_shape[:2]
-        margin_top = int(H * 0.05)
-        margin_bot = int(H * 0.95)
+        # Ignore header and footer zones entirely
+        margin_top = int(H * 0.10)
+        margin_bot = int(H * 0.90)
         features = [f for f in features if margin_top < f['y'] < margin_bot]
         if not features: return {}
 
@@ -342,7 +344,7 @@ class OMREngine:
         for col_feats in cols:
             if not col_feats: continue
 
-            # Group into rows by Y
+            # Group into rows by Y coordinate
             col_feats.sort(key=lambda f: f['y'])
             rows = []
             current_row = [col_feats[0]]
@@ -355,46 +357,48 @@ class OMREngine:
                     current_row = [f]
             rows.append(current_row)
 
-            # Filter out stray contours (logos/text) by enforcing vertical alignment of markers
-            valid_rows = []
-            if rows:
-                # The leftmost item of each valid row is the machine square
-                first_items_x = [r[0]['x'] for r in rows if r]
-                if first_items_x:
-                    median_marker_x = np.median(first_items_x)
-                    for r in rows:
-                        if r and abs(r[0]['x'] - median_marker_x) < W * 0.05:
-                            valid_rows.append(r)
+            # Filter out random stray lines by requiring rows to have enough items
+            valid_rows = [r for r in rows if len(r) >= 5] 
 
-            # Learn standard spacing from a perfect row (Square + 4 bubbles = 5 items)
-            ref_dx = [40, 80, 120, 160] # Fallback pixels
+            # Learn standard spacing from a clean row. 
+            # We assume: Leftmost = Square, Rightmost 4 = A, B, C, D
+            ref_dx = [70, 110, 150, 190] # Fallback pixel distances
             for r in valid_rows:
+                r.sort(key=lambda f: f['x'])
                 if len(r) >= 5:
-                    r.sort(key=lambda f: f['x'])
+                    anchor = r[0]
+                    bubbles = r[-4:] # Ignore text/noise in the middle, just take the 4 rightmost
                     ref_dx = [
-                        r[1]['x'] - r[0]['x'],
-                        r[2]['x'] - r[0]['x'],
-                        r[3]['x'] - r[0]['x'],
-                        r[4]['x'] - r[0]['x']
+                        bubbles[0]['x'] - anchor['x'],
+                        bubbles[1]['x'] - anchor['x'],
+                        bubbles[2]['x'] - anchor['x'],
+                        bubbles[3]['x'] - anchor['x']
                     ]
                     break
 
-            # Map the options anchoring to the machine reading square
-            for row in valid_rows:
+            # Map the options anchoring strictly to the left-most machine reading square
+            for row in rows: # Go through all rows again, even those missing bubbles
                 if q > 60: break
+                if len(row) < 2: continue # Ignore entirely empty rows
+
                 row.sort(key=lambda f: f['x'])
                 
-                # Element 0 is guaranteed to be the square marker due to sorting & alignment filter
+                # The leftmost item is the machine reading square
                 marker = row[0]
                 opts = {'marker': marker}
                 
-                if len(row) >= 5:
-                    opts['A'] = row[1]
-                    opts['B'] = row[2]
-                    opts['C'] = row[3]
-                    opts['D'] = row[4]
+                # Grab the rightmost items as the bubbles (max 4)
+                potential_bubbles = row[1:]
+                
+                if len(potential_bubbles) >= 4:
+                    bubbles = potential_bubbles[-4:]
+                    opts['A'] = bubbles[0]
+                    opts['B'] = bubbles[1]
+                    opts['C'] = bubbles[2]
+                    opts['D'] = bubbles[3]
                 else:
-                    # Interpolate perfectly if bubbles are faint/missing
+                    # Mathematical Interpolation: if a student erased so hard the circle is gone,
+                    # we use the learned distances from the square to locate A,B,C,D perfectly.
                     w, h = marker['w'], marker['h']
                     cy = marker['y']
                     for i, opt in enumerate(['A', 'B', 'C', 'D']):
