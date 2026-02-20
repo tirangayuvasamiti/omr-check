@@ -408,7 +408,7 @@ class OMREngine:
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
-default_keys_str = "B,C,A,D,A,B,D,C,A,C,B,D,A,B,C,D,B,A,D,C,C,D,B,A,D,C,A,B,B,D,C,A,A,C,D,B,C,B,A,D,D,A,C,B,B,C,D,A,C,D,B,A,D,B,A,C,B,D,C,A"
+default_keys_str = "B,B,B,C,C,A,A,B,B,C,A,D,B,C,C,C,D,B,D,C,A,D,C,C,A,C,D,D,A,A,A,B,D,C,D,C,A,D,B,B,A,B,A,C,A,A,D,D,D,B,C,B,D,C,B,A,B,A,A,C"
 default_keys = default_keys_str.split(',')
 initial_answer_key = {i + 1: default_keys[i] for i in range(60)}
 
@@ -625,3 +625,4 @@ st.markdown("""
   <div class="tricolor" style="max-width:130px;margin:0 auto 10px;"><div></div><div></div><div></div></div>
   Yuva Gyan Mahotsav 2026 · Tiranga Yuva Samiti · OMR Grader
 </div>""", unsafe_allow_html=True)
+
