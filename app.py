@@ -269,8 +269,7 @@ class OMRResult:
 # ─── OMR Engine ──────────────────────────────────────────────────────────────
 class OMREngine:
     """
-    Detects bubbles from the Yuva Gyan Mahotsav OMR sheet.
-    The sheet has 60 questions in 3 columns of 20, each with 4 options (A,B,C,D).
+    Detects bubbles from the Yuva Gyan Mahotsav OMR sheet using machine reading squares.
     """
 
     def pdf_to_image(self, pdf_bytes: bytes, dpi: int = 200) -> np.ndarray:
@@ -286,103 +285,127 @@ class OMREngine:
 
     def preprocess(self, img: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Increased blur slightly to handle scan noise
         blur = cv2.GaussianBlur(gray, (7, 7), 0)
         _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         
-        # Add morphological closing to fix disconnected/broken bubble outlines
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
         return thresh
 
     def detect_bubbles(self, img: np.ndarray) -> list:
+        # Now identifies ALL valid shapes (both machine squares and circles)
         thresh = self.preprocess(img)
-        # Changed to RETR_LIST to ensure bubbles inside bounding boxes/tables are found
         contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        bubbles = []
+        features = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            # Relaxed area limits to support different resolutions
             if area < 30 or area > 6000:
-                continue
-            peri = cv2.arcLength(cnt, True)
-            if peri == 0:
-                continue
-            circularity = 4 * np.pi * area / (peri * peri)
-            # Relaxed circularity to allow slightly oval/warped bubbles
-            if circularity < 0.2:
                 continue
             (x, y, w, h) = cv2.boundingRect(cnt)
             aspect = w / float(h)
-            # Relaxed aspect ratio
             if not (0.4 < aspect < 2.5):
                 continue
             if w < 5 or h < 5:
                 continue
             cx, cy = x + w // 2, y + h // 2
-            bubbles.append({'x': cx, 'y': cy, 'w': w, 'h': h, 'area': area,
-                            'cnt': cnt, 'bbox': (x, y, w, h)})
-        return bubbles
+            features.append({'x': cx, 'y': cy, 'w': w, 'h': h, 'area': area,
+                             'cnt': cnt, 'bbox': (x, y, w, h)})
+        return features
 
-    def cluster_bubbles_grid(self, bubbles: list, img_shape: tuple) -> dict:
+    def cluster_bubbles_grid(self, features: list, img_shape: tuple) -> dict:
         """
-        Groups bubbles into a 60x4 grid (questions x options).
-        Strategy: cluster by Y → rows, within each row cluster by X → options.
-        Uses the 3-column layout of the OMR.
+        Groups utilizing the Machine Reading Squares printed to the left of each question.
         """
-        if not bubbles:
-            return {}
+        if not features: return {}
 
         H, W = img_shape[:2]
-        # Relaxed margins to prevent cutting off top/bottom questions
         margin_top = int(H * 0.05)
         margin_bot = int(H * 0.95)
-        bubbles = [b for b in bubbles if margin_top < b['y'] < margin_bot]
+        features = [f for f in features if margin_top < f['y'] < margin_bot]
+        if not features: return {}
 
-        if not bubbles:
-            return {}
+        # 1. Split into 3 main columns based on X geometry
+        col_width = W / 3.0
+        cols = [[], [], []]
+        for f in features:
+            if f['x'] < col_width: cols[0].append(f)
+            elif f['x'] < 2 * col_width: cols[1].append(f)
+            else: cols[2].append(f)
 
-        # Sort by y
-        bubbles_sorted = sorted(bubbles, key=lambda b: b['y'])
-
-        # Find median bubble size for threshold
-        sizes = [b['w'] for b in bubbles]
-        med_size = np.median(sizes)
-        y_thresh = max(med_size * 1.2, 8)
-
-        # Cluster into rows
-        rows = []
-        current_row = [bubbles_sorted[0]]
-        for b in bubbles_sorted[1:]:
-            if abs(b['y'] - current_row[-1]['y']) < y_thresh:
-                current_row.append(b)
-            else:
-                rows.append(current_row)
-                current_row = [b]
-        rows.append(current_row)
-
-        # Filter rows that don't have ~4 or ~8 or ~12 bubbles (multiples of 4, 1-3 cols)
-        valid_rows = [r for r in rows if 3 <= len(r) <= 16]
-
-        # Build question→options mapping
-        # OMR has 3 columns of 20 questions, each with A B C D
         question_map = {}
         q = 1
-        for row in valid_rows:
-            row_sorted = sorted(row, key=lambda b: b['x'])
-            # Split row into groups of 4
-            for i in range(0, len(row_sorted), 4):
-                chunk = row_sorted[i:i+4]
-                if len(chunk) == 4:
-                    question_map[q] = {
-                        'A': chunk[0], 'B': chunk[1],
-                        'C': chunk[2], 'D': chunk[3]
-                    }
-                    q += 1
-                    if q > 60:
-                        break
-            if q > 60:
-                break
+
+        sizes = [f['h'] for f in features]
+        y_thresh = max(np.median(sizes) * 1.5, 10)
+
+        # 2. Process each column individually
+        for col_feats in cols:
+            if not col_feats: continue
+
+            # Group into rows by Y
+            col_feats.sort(key=lambda f: f['y'])
+            rows = []
+            current_row = [col_feats[0]]
+            for f in col_feats[1:]:
+                row_y = np.mean([item['y'] for item in current_row])
+                if abs(f['y'] - row_y) < y_thresh:
+                    current_row.append(f)
+                else:
+                    rows.append(current_row)
+                    current_row = [f]
+            rows.append(current_row)
+
+            # Filter out stray contours (logos/text) by enforcing vertical alignment of markers
+            valid_rows = []
+            if rows:
+                # The leftmost item of each valid row is the machine square
+                first_items_x = [r[0]['x'] for r in rows if r]
+                if first_items_x:
+                    median_marker_x = np.median(first_items_x)
+                    for r in rows:
+                        if r and abs(r[0]['x'] - median_marker_x) < W * 0.05:
+                            valid_rows.append(r)
+
+            # Learn standard spacing from a perfect row (Square + 4 bubbles = 5 items)
+            ref_dx = [40, 80, 120, 160] # Fallback pixels
+            for r in valid_rows:
+                if len(r) >= 5:
+                    r.sort(key=lambda f: f['x'])
+                    ref_dx = [
+                        r[1]['x'] - r[0]['x'],
+                        r[2]['x'] - r[0]['x'],
+                        r[3]['x'] - r[0]['x'],
+                        r[4]['x'] - r[0]['x']
+                    ]
+                    break
+
+            # Map the options anchoring to the machine reading square
+            for row in valid_rows:
+                if q > 60: break
+                row.sort(key=lambda f: f['x'])
+                
+                # Element 0 is guaranteed to be the square marker due to sorting & alignment filter
+                marker = row[0]
+                opts = {'marker': marker}
+                
+                if len(row) >= 5:
+                    opts['A'] = row[1]
+                    opts['B'] = row[2]
+                    opts['C'] = row[3]
+                    opts['D'] = row[4]
+                else:
+                    # Interpolate perfectly if bubbles are faint/missing
+                    w, h = marker['w'], marker['h']
+                    cy = marker['y']
+                    for i, opt in enumerate(['A', 'B', 'C', 'D']):
+                        cx = int(marker['x'] + ref_dx[i])
+                        opts[opt] = {
+                            'x': cx, 'y': int(cy), 'w': int(w), 'h': int(h),
+                            'bbox': (int(cx - w//2), int(cy - h//2), int(w), int(h))
+                        }
+                
+                question_map[q] = opts
+                q += 1
 
         return question_map
 
@@ -401,15 +424,15 @@ class OMREngine:
                          fill_thresh: float = 0.28,
                          multi_thresh: float = 0.28) -> dict:
         """
-        For each question, determine which bubbles are filled.
-        Returns dict: q_num → list of filled options
+        Determine which bubbles are filled based only on the A/B/C/D mapping.
         """
         thresh = self.preprocess(img)
         results = {}
         for q, opts in question_map.items():
             fills = {}
-            for opt, bubble in opts.items():
-                fills[opt] = self.measure_fill(img, bubble, thresh)
+            for opt in ['A', 'B', 'C', 'D']:
+                if opt in opts:
+                    fills[opt] = self.measure_fill(img, opts[opt], thresh)
             selected = [opt for opt, f in fills.items() if f >= fill_thresh]
             results[q] = {'selected': selected, 'fills': fills}
         return results
@@ -460,8 +483,17 @@ class OMREngine:
             )
             results.append(br)
 
-            # Annotate bubbles with clear specific colors for the light theme
-            for opt, bubble in opts_map.items():
+            # Annotate machine reading square first
+            marker = opts_map.get('marker')
+            if marker:
+                mx, my, mw, mh = marker['bbox']
+                cv2.rectangle(annotated, (mx, my), (mx+mw, my+mh), (0, 107, 255), 2) # Saffron box
+
+            # Annotate bubbles
+            for opt in ['A', 'B', 'C', 'D']:
+                if opt not in opts_map: continue
+                bubble = opts_map[opt]
+                
                 cx, cy = bubble['x'], bubble['y']
                 r = max(bubble['w'], bubble['h']) // 2 + 3
 
@@ -489,11 +521,10 @@ class OMREngine:
                 if key == opt and opt not in selected and status != 'correct':
                     cv2.circle(annotated, (cx, cy), r+5, (74, 163, 22), 2)
 
-            # Question number label - Dark gray for visibility
-            if opts_map:
-                first_b = list(opts_map.values())[0]
+            # Question number label drawn strictly using the marker
+            if marker:
                 cv2.putText(annotated, str(q),
-                            (first_b['x'] - 30, first_b['y'] + 5),
+                            (marker['x'] - 30, marker['y'] + 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (50, 50, 50), 1)
 
         # Tally
@@ -620,9 +651,9 @@ if uploaded:
     with col_grade_btn:
         st.write("") # Spacer
         if st.button("🚀 Grade OMR Sheet Now", use_container_width=True):
-            progress = st.progress(0, text="Detecting bubbles...")
+            progress = st.progress(0, text="Detecting anchors & bubbles...")
             time.sleep(0.3)
-            progress.progress(30, text="Clustering grid...")
+            progress.progress(30, text="Clustering grid via Machine Squares...")
             
             result, annotated = engine.grade(
                 img_cv,
