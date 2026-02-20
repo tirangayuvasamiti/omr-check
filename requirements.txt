@@ -5,4 +5,5 @@ Pillow
 PyMuPDF
 pandas
 scipy
-sklearn
+
+
