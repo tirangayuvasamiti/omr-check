@@ -7,3 +7,4 @@ pyzbar
 scipy
 PyMuPDF
 sklearn
+scikit-learn
