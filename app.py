@@ -3,505 +3,495 @@ import cv2
 import numpy as np
 from PIL import Image
 import pandas as pd
-import io
-import json
-import zipfile
+import io, json
 from datetime import datetime
-import imutils
-from imutils import contours as cont_utils
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-TOTAL_QUESTIONS = 60
-OPTIONS_PER_Q   = 4          # A B C D
-COLS_ON_SHEET   = 3          # 3 columns × 20 rows = 60 questions
-ROWS_PER_COL    = 20
-
+# ──────────────────────────────────────────────
+# PAGE CONFIG
+# ──────────────────────────────────────────────
 st.set_page_config(
     page_title="Yuva Gyan Mahotsav – OMR Grader",
     page_icon="📝",
     layout="wide",
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPER – image preprocessing
-# ─────────────────────────────────────────────────────────────────────────────
-def preprocess(img_bgr):
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 11, 2
-    )
-    return gray, thresh
+TOTAL_QUESTIONS  = 60
+OPTIONS_PER_Q    = 4       # A B C D
+QUESTIONS_PER_COL = 20     # 3 columns × 20 = 60
 
+OPT_LABELS = ["A", "B", "C", "D"]
+OPT_REV    = {v: i for i, v in enumerate(OPT_LABELS)}
 
-def find_document_contour(thresh):
-    """Find the largest quadrilateral – the OMR sheet boundary."""
-    cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = imutils.grab_contours(cnts)
-    doc_cnt = None
-    if cnts:
-        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
-        for c in cnts:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4:
-                doc_cnt = approx
-                break
-    return doc_cnt
+# ──────────────────────────────────────────────
+# IMAGE UTILITIES
+# ──────────────────────────────────────────────
 
+def pil_to_cv(pil_img):
+    return cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
 
-def four_point_transform(image, pts):
-    """Perspective-correct the sheet to a flat rectangle."""
-    rect = order_points(pts.reshape(4, 2).astype("float32"))
-    (tl, tr, br, bl) = rect
-    maxW = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
-    maxH = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
-    dst = np.array([[0,0],[maxW-1,0],[maxW-1,maxH-1],[0,maxH-1]], dtype="float32")
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxW, maxH))
-    return warped
-
-
-def order_points(pts):
+def order_pts(pts):
+    pts = pts.reshape(4, 2).astype("float32")
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
+    rect[0] = pts[np.argmin(s)]   # top-left
+    rect[2] = pts[np.argmax(s)]   # bottom-right
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
     return rect
 
+def four_point_transform(img, pts):
+    rect = order_pts(pts)
+    tl, tr, br, bl = rect
+    w = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+    h = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+    dst = np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype="float32")
+    M = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(img, M, (w, h))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CORE OMR DETECTION
-# ─────────────────────────────────────────────────────────────────────────────
-def detect_answers(warped_gray, debug=False):
-    """
-    Detect filled bubbles on the warped (perspective-corrected) OMR image.
-
-    Returns:
-        answers  – list of 60 ints (0=A,1=B,2=C,3=D, -1=unanswered, -2=multi)
-        debug_img – annotated image for review
-    """
-    h, w = warped_gray.shape
-
-    # Threshold
-    _, thresh = cv2.threshold(warped_gray, 0, 255,
-                              cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-
-    # Find all circular contours
-    cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = imutils.grab_contours(cnts)
-
-    bubble_cnts = []
+def deskew_sheet(bgr):
+    """Try to find and warp the sheet. Returns gray of warped (or original)."""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blur, 30, 100)
+    cnts, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:10]
     for c in cnts:
-        (x, y, cw, ch) = cv2.boundingRect(c)
-        ar = cw / float(ch)
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.contourArea(c) > (bgr.shape[0]*bgr.shape[1]*0.2):
+            warped = four_point_transform(bgr, approx)
+            return cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    return gray   # fallback – no sheet boundary found
+
+def standardize(gray, target_w=900):
+    """Resize to standard width for consistent processing."""
+    h, w = gray.shape
+    scale = target_w / w
+    return cv2.resize(gray, (target_w, int(h * scale)))
+
+# ──────────────────────────────────────────────
+# BUBBLE DETECTION
+# ──────────────────────────────────────────────
+
+def find_bubbles(gray):
+    """Return list of (x,y,r) for all detected bubbles."""
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    # Hough circles for robust bubble detection
+    circles = cv2.HoughCircles(
+        blur,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=12,
+        param1=60,
+        param2=25,
+        minRadius=6,
+        maxRadius=20,
+    )
+    if circles is not None:
+        return np.round(circles[0, :]).astype(int).tolist()
+    return []
+
+def find_bubbles_contour(gray):
+    """Fallback: contour-based bubble detection."""
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    bubbles = []
+    for c in cnts:
+        (x, y, w, h) = cv2.boundingRect(c)
+        ar = w / float(h) if h > 0 else 0
         area = cv2.contourArea(c)
-        if 0.7 <= ar <= 1.3 and 80 <= area <= 1800 and cw >= 8:
-            bubble_cnts.append(c)
+        if 0.65 <= ar <= 1.45 and 50 <= area <= 2000 and w >= 8:
+            cx, cy = x + w//2, y + h//2
+            r = (w + h) // 4
+            bubbles.append([cx, cy, r])
+    return bubbles
 
-    if len(bubble_cnts) < TOTAL_QUESTIONS * OPTIONS_PER_Q:
-        # Fallback: relax constraints
-        bubble_cnts = []
-        for c in cnts:
-            (x, y, cw, ch) = cv2.boundingRect(c)
-            ar = cw / float(ch)
-            area = cv2.contourArea(c)
-            if 0.6 <= ar <= 1.5 and 40 <= area <= 2500 and cw >= 6:
-                bubble_cnts.append(c)
+def is_filled(gray, cx, cy, r, threshold=0.45):
+    """Return True if ≥ threshold fraction of the circle area is dark."""
+    mask = np.zeros(gray.shape, np.uint8)
+    cv2.circle(mask, (cx, cy), max(r-2, 3), 255, -1)
+    roi = cv2.bitwise_and(gray, gray, mask=mask)
+    _, dark = cv2.threshold(roi, 80, 255, cv2.THRESH_BINARY_INV)
+    dark_pixels = cv2.countNonZero(cv2.bitwise_and(dark, dark, mask=mask))
+    total_pixels = cv2.countNonZero(mask)
+    return (dark_pixels / total_pixels) >= threshold if total_pixels > 0 else False
 
-    # Sort top-to-bottom then left-to-right
-    if not bubble_cnts:
-        return [-1] * TOTAL_QUESTIONS, warped_gray
+# ──────────────────────────────────────────────
+# GROUP BUBBLES → QUESTIONS
+# ──────────────────────────────────────────────
 
-    bubble_cnts = sorted(bubble_cnts, key=lambda c: cv2.boundingRect(c)[1])
-
-    # Group into rows (questions)
+def group_into_rows(bubbles, y_tol=14):
+    """Cluster bubbles by y-coordinate into rows."""
+    sorted_b = sorted(bubbles, key=lambda b: b[1])
     rows = []
-    current_row = [bubble_cnts[0]]
-    for c in bubble_cnts[1:]:
-        cy = cv2.boundingRect(c)[1]
-        prev_cy = cv2.boundingRect(current_row[-1])[1]
-        if abs(cy - prev_cy) < 12:
-            current_row.append(c)
+    cur = [sorted_b[0]]
+    for b in sorted_b[1:]:
+        if abs(b[1] - cur[-1][1]) <= y_tol:
+            cur.append(b)
         else:
-            rows.append(current_row)
-            current_row = [c]
-    rows.append(current_row)
+            rows.append(sorted(cur, key=lambda b: b[0]))
+            cur = [b]
+    rows.append(sorted(cur, key=lambda b: b[0]))
+    return rows
 
-    # Each row should have OPTIONS_PER_Q bubbles
-    valid_rows = [r for r in rows if len(r) == OPTIONS_PER_Q]
+def extract_answers(gray, show_debug=False):
+    """
+    Main pipeline. Returns:
+        answers    – list[int] length 60  (0=A,1=B,2=C,3=D,-1=blank,-2=multi)
+        debug_img  – BGR image with overlays
+        n_found    – how many bubbles were detected
+    """
+    debug_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-    # Re-sort each row left-to-right
-    valid_rows = [sorted(r, key=lambda c: cv2.boundingRect(c)[0]) for r in valid_rows]
+    # 1. Detect bubbles
+    bubbles = find_bubbles(gray)
+    if len(bubbles) < TOTAL_QUESTIONS * OPTIONS_PER_Q * 0.5:
+        bubbles = find_bubbles_contour(gray)
 
+    n_found = len(bubbles)
+
+    if n_found < TOTAL_QUESTIONS:
+        # Not enough bubbles – return blanks
+        return [-1] * TOTAL_QUESTIONS, debug_img, n_found
+
+    # 2. Group into rows
+    rows = group_into_rows(bubbles)
+
+    # 3. Keep only rows that have exactly OPTIONS_PER_Q bubbles
+    q_rows = [r for r in rows if len(r) == OPTIONS_PER_Q]
+
+    # 4. Determine fill status
     answers = []
-    debug_img = cv2.cvtColor(warped_gray, cv2.COLOR_GRAY2BGR)
-
-    for row in valid_rows[:TOTAL_QUESTIONS]:
+    for row in q_rows[:TOTAL_QUESTIONS]:
         filled = []
-        pixel_vals = []
-        for bubble in row:
-            mask = np.zeros(thresh.shape, dtype="uint8")
-            cv2.drawContours(mask, [bubble], -1, 255, -1)
-            total = cv2.countNonZero(cv2.bitwise_and(thresh, thresh, mask=mask))
-            pixel_vals.append(total)
-
-        max_val = max(pixel_vals)
-        threshold_val = max_val * 0.6  # 60 % of max = filled
-
-        for idx, (bubble, val) in enumerate(zip(row, pixel_vals)):
-            color = (0, 200, 0)
-            if val >= threshold_val:
-                filled.append(idx)
-                color = (0, 0, 255)
-            if debug:
-                cv2.drawContours(debug_img, [bubble], -1, color, 2)
+        for (cx, cy, r) in row:
+            filled_flag = is_filled(gray, cx, cy, r)
+            color = (0, 0, 220) if filled_flag else (0, 180, 0)
+            if show_debug:
+                cv2.circle(debug_img, (cx, cy), r, color, 2)
+                cv2.circle(debug_img, (cx, cy), 2, color, -1)
+            if filled_flag:
+                filled.append(row.index((cx, cy, r)))
 
         if len(filled) == 1:
             answers.append(filled[0])
         elif len(filled) == 0:
-            answers.append(-1)   # unanswered
+            answers.append(-1)
         else:
-            answers.append(-2)   # multiple marks
+            answers.append(-2)
 
-    # Pad if fewer rows detected
+    # Pad
     while len(answers) < TOTAL_QUESTIONS:
         answers.append(-1)
 
-    return answers[:TOTAL_QUESTIONS], debug_img
+    return answers[:TOTAL_QUESTIONS], debug_img, n_found
 
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 # SCORING
-# ─────────────────────────────────────────────────────────────────────────────
-def score_sheet(answers, answer_key, marks_correct=1.0, marks_wrong=-0.25):
+# ──────────────────────────────────────────────
+
+def score(answers, key, m_correct=1.0, m_wrong=-0.25):
     correct = wrong = unattempted = multi = 0
-    details = []
-    for i, (ans, key) in enumerate(zip(answers, answer_key)):
-        opt_map = {0: "A", 1: "B", 2: "C", 3: "D", -1: "—", -2: "Multi"}
-        marked = opt_map.get(ans, "?")
-        correct_opt = opt_map.get(key, "?")
-        if ans == -1:
-            unattempted += 1
-            status = "Unattempted"
-            score = 0
-        elif ans == -2:
-            multi += 1
-            status = "Multi-Mark"
-            score = marks_wrong
-            wrong += 1
-        elif ans == key:
-            correct += 1
-            status = "Correct ✅"
-            score = marks_correct
+    rows = []
+    for i, (a, k) in enumerate(zip(answers, key)):
+        a_lbl = OPT_LABELS[a] if 0 <= a <= 3 else ("—" if a == -1 else "Multi")
+        k_lbl = OPT_LABELS[k]
+        if a == -1:
+            unattempted += 1; s = 0; status = "Unattempted"
+        elif a == -2:
+            multi += 1; wrong += 1; s = m_wrong; status = "Multi-Mark ⚠️"
+        elif a == k:
+            correct += 1; s = m_correct; status = "Correct ✅"
         else:
-            wrong += 1
-            status = "Wrong ❌"
-            score = marks_wrong
-        details.append({
-            "Q#": i + 1,
-            "Marked": marked,
-            "Correct": correct_opt,
-            "Status": status,
-            "Score": score,
-        })
-    total = correct * marks_correct + wrong * marks_wrong
-    return {
-        "correct": correct,
-        "wrong": wrong,
-        "unattempted": unattempted,
-        "multi": multi,
-        "total": round(total, 2),
-        "details": details,
-    }
+            wrong += 1; s = m_wrong; status = "Wrong ❌"
+        rows.append({"Q#": i+1, "Marked": a_lbl, "Correct": k_lbl,
+                     "Status": status, "Score": s})
+    total = round(correct * m_correct + wrong * m_wrong, 2)
+    return dict(correct=correct, wrong=wrong, unattempted=unattempted,
+                multi=multi, total=total, details=rows)
 
+def grade_label(pct):
+    return ("A+" if pct>=90 else "A" if pct>=80 else "B" if pct>=70
+            else "C" if pct>=60 else "D" if pct>=50 else "F")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PROCESS SINGLE IMAGE
-# ─────────────────────────────────────────────────────────────────────────────
-def process_image(uploaded_file, answer_key, marks_correct, marks_wrong, debug):
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        return None, None, None, "Could not decode image."
+# ──────────────────────────────────────────────
+# SIDEBAR
+# ──────────────────────────────────────────────
 
-    gray, thresh = preprocess(img_bgr)
-    doc_cnt = find_document_contour(thresh)
+with st.sidebar:
+    st.markdown("## ⚙️ Settings")
 
-    if doc_cnt is not None:
-        warped = four_point_transform(gray, doc_cnt)
-    else:
-        warped = gray  # Use as-is if no boundary found
+    # ── Answer Key ──
+    st.markdown("### 📋 Answer Key (60 Qs)")
+    key_method = st.radio("Input method", ["Manual", "Upload CSV", "Upload JSON"],
+                          horizontal=True)
 
-    # Resize to standard height for consistent processing
-    target_h = 1400
-    scale = target_h / warped.shape[0]
-    warped_resized = cv2.resize(warped, (int(warped.shape[1] * scale), target_h))
+    answer_key = []
 
-    answers, debug_img = detect_answers(warped_resized, debug=debug)
-    result = score_sheet(answers, answer_key, marks_correct, marks_wrong)
-    return answers, result, debug_img, None
+    if key_method == "Manual":
+        for i in range(0, TOTAL_QUESTIONS, 10):
+            cols = st.columns(10)
+            for j, col in enumerate(cols):
+                qi = i + j
+                if qi < TOTAL_QUESTIONS:
+                    v = col.selectbox(f"Q{qi+1}", OPT_LABELS,
+                                      key=f"k{qi}", label_visibility="collapsed")
+                    answer_key.append(OPT_REV[v])
 
+    elif key_method == "Upload CSV":
+        f = st.file_uploader("CSV: one column of answers", type="csv")
+        if f:
+            try:
+                df = pd.read_csv(f)
+                col = df.columns[-1]
+                answer_key = [OPT_REV[str(v).strip().upper()] for v in df[col][:TOTAL_QUESTIONS]]
+                st.success(f"Key loaded – {len(answer_key)} questions")
+            except Exception as e:
+                st.error(f"Parse error: {e}")
+        if not answer_key:
+            answer_key = [0] * TOTAL_QUESTIONS
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STREAMLIT UI
-# ─────────────────────────────────────────────────────────────────────────────
-def main():
-    # ── Sidebar: Answer Key + Settings ───────────────────────────────────────
-    with st.sidebar:
-        st.image("https://via.placeholder.com/200x60/FF9933/FFFFFF?text=Yuva+Gyan+Mahotsav",
-                 use_column_width=True)
-        st.title("⚙️ Settings")
+    else:  # JSON
+        f = st.file_uploader("JSON: list or dict", type="json")
+        if f:
+            try:
+                data = json.load(f)
+                if isinstance(data, list):
+                    answer_key = [OPT_REV[x.upper()] for x in data[:TOTAL_QUESTIONS]]
+                else:
+                    answer_key = [OPT_REV[data[str(i+1)].upper()] for i in range(TOTAL_QUESTIONS)]
+                st.success(f"Key loaded – {len(answer_key)} questions")
+            except Exception as e:
+                st.error(f"Parse error: {e}")
+        if not answer_key:
+            answer_key = [0] * TOTAL_QUESTIONS
 
-        st.subheader("📋 Answer Key")
-        key_method = st.radio("Enter key via:", ["Manual Entry", "Upload CSV/JSON"])
+    if not answer_key:
+        answer_key = [0] * TOTAL_QUESTIONS
+    while len(answer_key) < TOTAL_QUESTIONS:
+        answer_key.append(0)
 
-        answer_key = []
-        opt_map_rev = {"A": 0, "B": 1, "C": 2, "D": 3}
+    # ── Marking Scheme ──
+    st.markdown("### 🎯 Marking Scheme")
+    m_correct = st.number_input("Correct  (+)", value=1.0, step=0.25, min_value=0.0)
+    m_wrong   = st.number_input("Wrong    (−)", value=-0.25, step=0.25, max_value=0.0)
 
-        if key_method == "Manual Entry":
-            st.caption("Enter A / B / C / D for each question.")
-            cols_k = st.columns(3)
-            for i in range(TOTAL_QUESTIONS):
-                col = cols_k[i % 3]
-                val = col.selectbox(f"Q{i+1}", ["A","B","C","D"],
-                                    key=f"key_{i}", label_visibility="collapsed")
-                answer_key.append(opt_map_rev[val])
-            # Show compact preview
-            key_str = " ".join([["A","B","C","D"][k] for k in answer_key])
-            st.caption(f"Key: `{key_str}`")
-        else:
-            key_file = st.file_uploader("Upload key (CSV or JSON)", type=["csv","json"])
-            if key_file:
-                try:
-                    if key_file.name.endswith(".json"):
-                        data = json.load(key_file)
-                        # Accept {"1":"A","2":"B",...} or ["A","B",...]
-                        if isinstance(data, list):
-                            answer_key = [opt_map_rev[x.upper()] for x in data[:TOTAL_QUESTIONS]]
-                        else:
-                            answer_key = [opt_map_rev[data[str(i+1)].upper()] for i in range(TOTAL_QUESTIONS)]
-                    else:
-                        df_key = pd.read_csv(key_file)
-                        col_name = df_key.columns[-1]
-                        answer_key = [opt_map_rev[str(v).strip().upper()] for v in df_key[col_name][:TOTAL_QUESTIONS]]
-                    st.success(f"✅ Key loaded ({len(answer_key)} questions)")
-                except Exception as e:
-                    st.error(f"Key parse error: {e}")
-                    answer_key = [0] * TOTAL_QUESTIONS
-            else:
-                answer_key = [0] * TOTAL_QUESTIONS
-                st.info("No key uploaded – defaulting all to A.")
+    # ── Debug ──
+    st.markdown("### 🔬 Debug")
+    show_debug = st.toggle("Show bubble overlay", value=False)
+    sensitivity = st.slider("Fill sensitivity (lower = stricter)", 0.2, 0.7, 0.45, 0.05,
+                            help="Fraction of circle that must be dark to count as filled")
 
-        st.subheader("🎯 Marking Scheme")
-        marks_correct = st.number_input("Marks for Correct", value=1.0, step=0.25)
-        marks_wrong   = st.number_input("Marks for Wrong (negative)",
-                                        value=-0.25, max_value=0.0, step=0.25)
+# ──────────────────────────────────────────────
+# MAIN TABS
+# ──────────────────────────────────────────────
 
-        st.subheader("🔬 Debug")
-        show_debug = st.checkbox("Show bubble detection overlay", value=False)
+st.title("📝 Yuva Gyan Mahotsav 2026 – OMR Auto Grader")
+st.caption("Tiranga Yuva Samiti · Upload scanned OMR sheets to auto-detect and grade answers.")
 
-    # ── Main Area ─────────────────────────────────────────────────────────────
-    st.title("📝 Yuva Gyan Mahotsav 2026 – OMR Auto Grader")
-    st.markdown("Upload scanned OMR sheets to auto-detect and grade answers.")
+tab1, tab2, tab3 = st.tabs(["📤 Upload & Grade", "📊 Batch Results", "ℹ️ Help"])
 
-    tab1, tab2, tab3 = st.tabs(["📤 Upload & Grade", "📊 Batch Results", "ℹ️ How to Use"])
+# ─── TAB 1 ───────────────────────────────────
+with tab1:
+    files = st.file_uploader(
+        "Upload OMR sheet images (JPG / PNG)",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True,
+    )
 
-    # ── Tab 1: Upload & Grade ─────────────────────────────────────────────────
-    with tab1:
-        uploaded_files = st.file_uploader(
-            "Upload OMR sheet images (JPG/PNG/PDF*)",
-            type=["jpg","jpeg","png"],
-            accept_multiple_files=True,
+    if not files:
+        st.info("👆 Upload one or more scanned OMR sheet images to begin.")
+        st.image(
+            "https://via.placeholder.com/700x350/FFF5E6/FF9933?text=Upload+your+OMR+sheets+above",
+            use_column_width=True,
         )
+    else:
+        batch = []
 
-        if uploaded_files:
-            if len(answer_key) < TOTAL_QUESTIONS:
-                st.warning("⚠️ Answer key is incomplete. Please set it in the sidebar.")
+        for idx, uf in enumerate(files):
+            st.divider()
+            st.subheader(f"Sheet {idx+1} · `{uf.name}`")
 
-            all_results = []
-            for idx, uf in enumerate(uploaded_files):
-                st.divider()
-                st.subheader(f"Sheet {idx+1}: `{uf.name}`")
+            try:
+                pil_img = Image.open(uf)
+            except Exception as e:
+                st.error(f"Cannot open image: {e}")
+                continue
 
-                with st.spinner("Processing..."):
-                    uf.seek(0)
-                    answers, result, debug_img, err = process_image(
-                        uf, answer_key, marks_correct, marks_wrong, show_debug
-                    )
+            with st.spinner("Detecting bubbles…"):
+                bgr = pil_to_cv(pil_img)
+                gray = deskew_sheet(bgr)
+                gray = standardize(gray)
+                answers, dbg_img, n_found = extract_answers(gray, show_debug)
+                result = score(answers, answer_key, m_correct, m_wrong)
 
-                if err:
-                    st.error(f"❌ Error: {err}")
-                    continue
+            # ── Layout ──
+            col_l, col_r = st.columns([1, 1])
 
-                # Layout
-                col_img, col_score = st.columns([1, 1])
+            with col_l:
+                if show_debug:
+                    st.image(cv2.cvtColor(dbg_img, cv2.COLOR_BGR2RGB),
+                             caption=f"Bubble overlay · {n_found} bubbles found",
+                             use_column_width=True)
+                else:
+                    st.image(pil_img, caption="Uploaded sheet", use_column_width=True)
+                st.caption(f"ℹ️ {n_found} bubbles detected "
+                           f"(need {TOTAL_QUESTIONS * OPTIONS_PER_Q} for 60 Qs × 4 opts)")
+                if n_found < TOTAL_QUESTIONS * OPTIONS_PER_Q * 0.7:
+                    st.warning("⚠️ Low bubble count – try a clearer / higher-res scan, "
+                               "or adjust sensitivity in sidebar.")
 
-                with col_img:
-                    if show_debug and debug_img is not None:
-                        st.image(cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB),
-                                 caption="Bubble Detection Overlay", use_column_width=True)
-                    else:
-                        uf.seek(0)
-                        st.image(uf, caption="Uploaded Sheet", use_column_width=True)
+            with col_r:
+                pct = (result["correct"] / TOTAL_QUESTIONS) * 100
+                g = grade_label(pct)
 
-                with col_score:
-                    # Score summary
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("✅ Correct", result["correct"])
-                    m2.metric("❌ Wrong", result["wrong"])
-                    m3.metric("⬜ Unattempted", result["unattempted"])
-                    m4.metric("🏆 Total Score", result["total"])
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("✅ Correct",     result["correct"])
+                m2.metric("❌ Wrong",       result["wrong"])
+                m3.metric("⬜ Unattempted", result["unattempted"])
+                m4.metric("🏆 Score",       result["total"])
 
-                    pct = (result["correct"] / TOTAL_QUESTIONS) * 100
-                    grade = ("A+" if pct>=90 else "A" if pct>=80 else "B" if pct>=70
-                             else "C" if pct>=60 else "D" if pct>=50 else "F")
-                    st.progress(pct / 100)
-                    st.markdown(f"**Grade: {grade}** &nbsp;&nbsp; ({pct:.1f}%)")
-
-                    if result["multi"] > 0:
-                        st.warning(f"⚠️ {result['multi']} questions have multiple marks.")
-
-                # Detailed table
-                with st.expander("📋 Question-wise breakdown"):
-                    df_detail = pd.DataFrame(result["details"])
-                    def color_status(val):
-                        if "Correct" in str(val): return "background-color: #d4edda"
-                        if "Wrong" in str(val) or "Multi" in str(val): return "background-color: #f8d7da"
-                        return ""
-                    st.dataframe(
-                        df_detail.style.applymap(color_status, subset=["Status"]),
-                        use_container_width=True, height=300
-                    )
-
-                # Download single result
-                csv_single = df_detail.to_csv(index=False).encode()
-                st.download_button(
-                    f"⬇️ Download result for {uf.name}",
-                    data=csv_single,
-                    file_name=f"result_{uf.name.rsplit('.',1)[0]}.csv",
-                    mime="text/csv",
-                    key=f"dl_{idx}"
+                st.progress(pct / 100)
+                grade_color = {"A+":"🟢","A":"🟢","B":"🔵","C":"🟡","D":"🟠","F":"🔴"}
+                st.markdown(
+                    f"**Grade: {grade_color.get(g,'⚪')} {g}** &nbsp; ({pct:.1f}%)"
                 )
 
-                all_results.append({
-                    "File": uf.name,
-                    "Correct": result["correct"],
-                    "Wrong": result["wrong"],
-                    "Unattempted": result["unattempted"],
-                    "Multi-Mark": result["multi"],
-                    "Total Score": result["total"],
-                    "Percentage": round(pct, 2),
-                    "Grade": grade,
-                    "Answers": ",".join([["A","B","C","D","—","Multi"][min(a,5)] for a in answers]),
-                })
+                if result["multi"]:
+                    st.warning(f"⚠️ {result['multi']} question(s) have multiple bubbles filled.")
 
-            # Store for Batch tab
-            if all_results:
-                st.session_state["batch_results"] = all_results
+            with st.expander("📋 Question-wise breakdown"):
+                df_d = pd.DataFrame(result["details"])
 
-    # ── Tab 2: Batch Results ──────────────────────────────────────────────────
-    with tab2:
-        if "batch_results" not in st.session_state or not st.session_state["batch_results"]:
-            st.info("Upload and grade sheets in Tab 1 to see batch results here.")
-        else:
-            br = st.session_state["batch_results"]
-            df_batch = pd.DataFrame(br)
+                def highlight(row):
+                    if "Correct" in row["Status"]:   return ["background-color:#d4edda"]*len(row)
+                    if "Wrong"   in row["Status"]:   return ["background-color:#f8d7da"]*len(row)
+                    if "Multi"   in row["Status"]:   return ["background-color:#fff3cd"]*len(row)
+                    return [""]*len(row)
 
-            st.subheader(f"📊 Summary – {len(df_batch)} sheet(s) graded")
+                st.dataframe(
+                    df_d.style.apply(highlight, axis=1),
+                    use_container_width=True, height=280,
+                )
 
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Avg Score", f"{df_batch['Total Score'].mean():.2f}")
-            c2.metric("Highest", f"{df_batch['Total Score'].max():.2f}")
-            c3.metric("Lowest", f"{df_batch['Total Score'].min():.2f}")
-
-            st.dataframe(df_batch.drop(columns=["Answers"]), use_container_width=True)
-
-            # Grade distribution
-            st.subheader("Grade Distribution")
-            grade_counts = df_batch["Grade"].value_counts().reset_index()
-            grade_counts.columns = ["Grade","Count"]
-            st.bar_chart(grade_counts.set_index("Grade"))
-
-            # Download all
-            csv_all = df_batch.to_csv(index=False).encode()
+            uf.seek(0)
+            csv_bytes = df_d.to_csv(index=False).encode()
             st.download_button(
-                "⬇️ Download All Results (CSV)",
-                data=csv_all,
-                file_name=f"omr_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                f"⬇️ Download result – {uf.name}",
+                data=csv_bytes,
+                file_name=f"result_{uf.name.rsplit('.',1)[0]}.csv",
                 mime="text/csv",
+                key=f"dl_{idx}",
             )
 
-            # JSON export
-            json_all = json.dumps(br, indent=2).encode()
-            st.download_button(
-                "⬇️ Download All Results (JSON)",
-                data=json_all,
-                file_name=f"omr_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json",
-            )
+            batch.append({
+                "File": uf.name,
+                "Bubbles Found": n_found,
+                "Correct": result["correct"],
+                "Wrong": result["wrong"],
+                "Unattempted": result["unattempted"],
+                "Multi-Mark": result["multi"],
+                "Total Score": result["total"],
+                "Percentage": round(pct, 2),
+                "Grade": g,
+                "Answers": ",".join([
+                    OPT_LABELS[a] if 0<=a<=3 else ("—" if a==-1 else "M")
+                    for a in answers
+                ]),
+            })
 
-    # ── Tab 3: How to Use ─────────────────────────────────────────────────────
-    with tab3:
-        st.markdown("""
-## 📖 How to Use the OMR Grader
+        if batch:
+            st.session_state["batch"] = batch
 
-### Step 1 – Set the Answer Key
-- In the **sidebar**, enter the correct answer (A/B/C/D) for all 60 questions.
-- Or upload a **CSV** (one column of answers) or **JSON** file.
+# ─── TAB 2 ───────────────────────────────────
+with tab2:
+    br = st.session_state.get("batch", [])
+    if not br:
+        st.info("Grade sheets in Tab 1 first.")
+    else:
+        df_b = pd.DataFrame(br)
+        st.subheader(f"📊 Batch Summary – {len(df_b)} sheet(s)")
 
-### Step 2 – Configure Marking Scheme
-- Default: **+1** for correct, **−0.25** for wrong.
-- Adjust in the sidebar as needed.
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Average Score",  f"{df_b['Total Score'].mean():.2f}")
+        c2.metric("Highest Score",  f"{df_b['Total Score'].max():.2f}")
+        c3.metric("Lowest Score",   f"{df_b['Total Score'].min():.2f}")
+        c4.metric("Average %",      f"{df_b['Percentage'].mean():.1f}%")
 
-### Step 3 – Upload OMR Sheets
-- Go to **Upload & Grade** tab.
-- Upload one or more scanned OMR images (JPG/PNG).
-- Best scan quality: **300 DPI**, flat, well-lit, no shadows.
+        st.dataframe(df_b.drop(columns=["Answers"]), use_container_width=True)
 
-### Step 4 – Review Results
-- Each sheet shows a score summary and question-wise breakdown.
-- Switch to **Batch Results** to compare all sheets and download reports.
+        st.subheader("Grade Distribution")
+        gc = df_b["Grade"].value_counts().reindex(
+            ["A+","A","B","C","D","F"], fill_value=0
+        )
+        st.bar_chart(gc)
 
----
-### 📸 Scanning Tips
-| Do ✅ | Avoid ❌ |
-|---|---|
-| Scan at 300 DPI | Low-res phone photos |
-| Keep sheet flat | Wrinkled / folded sheets |
-| Good even lighting | Strong shadows / glare |
-| Full sheet visible | Cropped edges |
-| Dark filled bubbles | Lightly filled bubbles |
+        col_a, col_b = st.columns(2)
+        col_a.download_button(
+            "⬇️ Download CSV",
+            data=df_b.to_csv(index=False).encode(),
+            file_name=f"omr_batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+        )
+        col_b.download_button(
+            "⬇️ Download JSON",
+            data=json.dumps(br, indent=2).encode(),
+            file_name=f"omr_batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+        )
 
-### 📁 Answer Key Format (CSV)
+# ─── TAB 3 ───────────────────────────────────
+with tab3:
+    st.markdown("""
+## How to Use
+
+### 1 · Set the Answer Key
+Choose **Manual**, **Upload CSV**, or **Upload JSON** in the sidebar.
+
+**CSV format:**
 ```
 Question,Answer
 1,A
 2,C
 3,B
-...
 ```
 
-### 📁 Answer Key Format (JSON)
+**JSON format (dict or list):**
 ```json
-{"1":"A","2":"C","3":"B",...}
+{"1":"A","2":"C","3":"B"}
 ```
-or as a list:
-```json
-["A","C","B","D",...]
-```
+or `["A","C","B","D",...]`
 
 ---
-*Powered by OpenCV + Streamlit · Yuva Gyan Mahotsav 2026 · Tiranga Yuva Samiti*
-        """)
 
+### 2 · Adjust Marking Scheme
+Default: **+1** correct, **−0.25** wrong. Change in sidebar.
 
-if __name__ == "__main__":
-    main()
+---
+
+### 3 · Upload OMR Sheets
+- Go to **Upload & Grade** tab
+- Upload JPG / PNG images (one or many)
+
+---
+
+### 4 · If Bubbles Aren't Detected Correctly
+- Enable **Show bubble overlay** in sidebar to see what's being detected
+- Adjust **Fill sensitivity** slider (lower = stricter; raise it if blanks are marked filled)
+- Rescan at higher resolution / better lighting
+
+---
+
+## 📸 Scanning Tips
+
+| ✅ Do | ❌ Avoid |
+|---|---|
+| 300 DPI scan or clear photo | Blurry phone shots |
+| Even, bright lighting | Shadows / glare |
+| Sheet flat & fully in frame | Edges cut off |
+| Dark, fully filled bubbles | Partial / light fills |
+
+---
+*Yuva Gyan Mahotsav 2026 · Tiranga Yuva Samiti*
+    """)
