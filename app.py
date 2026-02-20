@@ -102,7 +102,7 @@ html,body,[class*="css"]{font-family:'Space Grotesk',sans-serif;background:var(-
 .bs-c{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);color:#22C55E;}
 .bs-w{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#EF4444;}
 .bs-s{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);color:#F59E0B;}
-.bs-m{background:rgba(168,85,247,.1);border:1px solid rgba(168,85,247,.3);color:#A855F7;}.bs-b{background:rgba(96,165,250,.1);border:1px solid rgba(96,165,250,.3);color:#60A5FA;}
+.bs-m{background:rgba(168,85,247,.1);border:1px solid rgba(168,85,247,.3);color:#A855F7;}
 .legend{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 14px;}
 .chip{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:.72rem;font-weight:600;border:1px solid;}
 .ch-g{background:rgba(34,197,94,.08);border-color:rgba(34,197,94,.3);color:#22C55E;}
@@ -356,13 +356,12 @@ class OMREngine:
                     status, score = 'unattempted', 0.0
                 elif len(selected) > 1:
                     status, score = 'multi', (-neg if key else 0.0)
-                elif not key:
-                    # Bubble detected but no answer key set — mark as answered (neutral)
-                    status, score = 'answered', 0.0
-                elif selected[0] == key:
+                elif key and selected[0] == key:
                     status, score = 'correct', float(pos)
-                else:
+                elif key:
                     status, score = 'wrong', float(-neg)
+                else:
+                    status, score = 'unattempted', 0.0
 
                 results.append(BubbleResult(
                     q_num=q_num, detected=selected, answer_key=key,
@@ -370,10 +369,8 @@ class OMREngine:
                 ))
 
                 # ── Draw ──────────────────────────────────────────────────
-                C_ANSWERED = (50, 170, 240)
-                clr = {'correct': C_CORRECT, 'wrong': C_WRONG,
-                       'multi': C_MULTI, 'unattempted': C_UNATTEMPT,
-                       'answered': C_ANSWERED}[status]
+                clr = {'correct':C_CORRECT,'wrong':C_WRONG,
+                       'multi':C_MULTI,'unattempted':C_UNATTEMPT}[status]
 
                 for opt in 'ABCD':
                     cx = BUBBLE_CX[col_idx][opt]
@@ -387,7 +384,7 @@ class OMREngine:
 
                     # Green ring: show where correct answer was, if student was wrong
                     if (key == opt and opt not in selected
-                            and status not in ('correct', 'unattempted', 'answered')):
+                            and status not in ('correct', 'unattempted')):
                         cv2.circle(canvas, (cx, cy), DRAW_R + 4, C_CORR_IND, 2)
 
         correct = sum(1 for r in results if r.status == 'correct')
@@ -398,6 +395,10 @@ class OMREngine:
         self._log(f"Done: {correct}✓ {wrong}✗ {unat}— {multi}M  → {ps-ns:.1f}", 'ok')
 
         return (
+            OMREngine(bubbles=results, correct=correct, wrong=wrong,
+                      unattempted=unat, multi=multi,
+                      pos_score=ps, neg_score=ns, total_score=ps - ns,
+                      debug_log=list(self._logs)) if isinstance(self, OMREngine) else 
             OMRResult(bubbles=results, correct=correct, wrong=wrong,
                       unattempted=unat, multi=multi,
                       pos_score=ps, neg_score=ns, total_score=ps - ns,
@@ -407,7 +408,11 @@ class OMREngine:
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
-for k, v in {'answer_key': {i: '' for i in range(1, 61)},
+default_keys_str = "B,C,A,D,A,B,D,C,B,A,C,D,D,A,B,C,C,D,A,B,B,A,D,C,A,C,B,D,D,B,A,C,C,A,D,B,B,D,C,A,A,B,C,D,D,C,B,A,C,A,B,D,B,C,A,D,C,B,A,D"
+default_keys = default_keys_str.split(',')
+initial_answer_key = {i + 1: default_keys[i] for i in range(60)}
+
+for k, v in {'answer_key': initial_answer_key,
               'result': None, 'annotated_img': None}.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -458,24 +463,11 @@ with st.sidebar:
 st.markdown('<div class="sh"><div class="sdot"></div><h3>Upload OMR Sheet</h3></div>',
             unsafe_allow_html=True)
 st.markdown("""
-<div class="struct-diagram">
-  YGM 2026 verified structure — 3 columns × 20 rows = 60 questions<br>
-  <span class="sq">■</span>(L)&nbsp;
-  <span class="cir">A○</span>&nbsp;
-  <span class="cir">B○</span>&nbsp;
-  <span class="cir">C○</span>&nbsp;
-  <span class="cir">D○</span>&nbsp;
-  <span class="sq">■</span>(R) &nbsp;per row
-  &nbsp;·&nbsp; Row 1 Y=360 &nbsp;·&nbsp; Spacing=54.5px
-</div>
-""", unsafe_allow_html=True)
-st.markdown("""
 <div class="legend">
   <span class="chip ch-g">● Correct</span>
   <span class="chip ch-r">● Wrong</span>
   <span class="chip ch-n">○ Unattempted</span>
   <span class="chip ch-p">● Multi-Mark</span>
-  <span class="chip ch-b" style="background:rgba(96,165,250,.08);border-color:rgba(96,165,250,.3);color:#60A5FA;">● Answered (no key)</span>
   <span class="chip ch-g">◎ Missed correct</span>
 </div>""", unsafe_allow_html=True)
 
@@ -492,35 +484,42 @@ if uploaded:
                   else engine.load_img(Image.open(io.BytesIO(fb))))
     st.success(f"✅ **{uploaded.name}** — {img_cv.shape[1]}×{img_cv.shape[0]}px")
 
-    c1, c2 = st.columns(2)
-    with c1:
+    st.markdown("**⚙️ Settings**")
+    st.info(f"**Marking:** +{pos_mark:.1f} correct · −{neg_mark:.1f} wrong/multi")
+    
+    if st.button("🚀  Grade Now", use_container_width=True):
+        bar = st.progress(0, text="Scaling to canonical frame…")
+        time.sleep(0.05); bar.progress(30, text="Checking skew…")
+        time.sleep(0.05); bar.progress(55, text="Sampling bubbles…")
+
+        result, annotated = engine.grade(
+            img_cv, st.session_state.answer_key,
+            pos=pos_mark, neg=neg_mark)
+
+        bar.progress(95, text="Rendering annotation…")
+        st.session_state.result = result
+        st.session_state.annotated_img = annotated
+        bar.progress(100); time.sleep(0.1); bar.empty()
+        st.success("✅ Graded!")
+
+    # ── Side-by-Side Display Logic ────────────────────────────────────────────
+    if st.session_state.result is not None and st.session_state.annotated_img is not None:
+        st.markdown("---")
+        c_orig, c_ann = st.columns(2)
+        with c_orig:
+            st.markdown("**📄 Original Upload**")
+            st.image(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB), use_container_width=True)
+        with c_ann:
+            st.markdown("**🎯 Annotated OMR Sheet**")
+            ann = cv2.cvtColor(st.session_state.annotated_img, cv2.COLOR_BGR2RGB)
+            st.image(ann, use_container_width=True)
+            buf = io.BytesIO()
+            Image.fromarray(ann).save(buf, 'PNG')
+            st.download_button("⬇️ Download Annotated OMR", buf.getvalue(),
+                               "annotated_omr.png", "image/png", use_container_width=True)
+    else:
         st.markdown("**📄 Original Upload**")
         st.image(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB), use_container_width=True)
-    with c2:
-        st.markdown("**⚙️ Settings**")
-        st.info(f"""
-**Marking:** +{pos_mark:.1f} correct · −{neg_mark:.1f} wrong/multi  
-**Grid:** Pixel-verified YGM 2026 coordinates  
-**Detection:** Relative darkness (empty≈0.33 / filled≈1.00)  
-**Annotation:** Drawn directly on scaled canonical image  
-
-⚠️ **Set Answer Key in sidebar to grade (Correct / Wrong).**  
-Without a key, filled bubbles show as Answered (cyan).
-        """)
-        if st.button("🚀  Grade Now", use_container_width=True):
-            bar = st.progress(0, text="Scaling to canonical frame…")
-            time.sleep(0.05); bar.progress(30, text="Checking skew…")
-            time.sleep(0.05); bar.progress(55, text="Sampling bubbles…")
-
-            result, annotated = engine.grade(
-                img_cv, st.session_state.answer_key,
-                pos=pos_mark, neg=neg_mark)
-
-            bar.progress(95, text="Rendering annotation…")
-            st.session_state.result = result
-            st.session_state.annotated_img = annotated
-            bar.progress(100); time.sleep(0.1); bar.empty()
-            st.success("✅ Graded!")
 
 # ── Results ───────────────────────────────────────────────────────────────────
 if st.session_state.result is not None:
@@ -560,47 +559,38 @@ if st.session_state.result is not None:
     </div>""", unsafe_allow_html=True)
 
     st.markdown("---")
-    cl, cr = st.columns(2)
-    with cl:
-        st.markdown("**📉 Breakdown**")
-        att = result.correct + result.wrong + result.multi
-        acc = result.correct / att * 100 if att else 0
-        m1,m2 = st.columns(2); m3,m4 = st.columns(2)
-        m1.metric("Positive Score", f"+{result.pos_score:.1f}")
-        m2.metric("Negative Score", f"−{result.neg_score:.1f}")
-        m3.metric("Net Score", f"{result.total_score:.1f}")
-        m4.metric("Accuracy", f"{acc:.1f}%")
-        info_rows = ''.join(
-            f'<div style="display:flex;justify-content:space-between;font-size:.85rem;padding:3px 0;">'
-            f'<span>{l}</span><span style="font-weight:700;">{v}</span></div>'
-            for l,v in [("Attempted",f"{att}/60 ({att/60*100:.0f}%)"),
-                        ("Unattempted",str(result.unattempted)),
-                        ("Multi-marked",str(result.multi))])
-        st.markdown(f'<div style="background:var(--sf2);border:1px solid var(--br);border-radius:10px;'
-                    f'padding:13px 16px;margin-top:10px;"><div style="font-size:.68rem;color:var(--mu);'
-                    f'text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px;">Summary</div>'
-                    f'{info_rows}</div>', unsafe_allow_html=True)
-        if show_debug and result.debug_log:
-            html = "".join(f'<div class="{"ok" if "[OK]" in l else "warn" if "[WARN]" in l else "err" if "[ERR]" in l else "info"}">{l}</div>'
-                           for l in result.debug_log)
-            st.markdown(f'<div class="dlog">{html}</div>', unsafe_allow_html=True)
+    st.markdown("**📉 Breakdown**")
+    att = result.correct + result.wrong + result.multi
+    acc = result.correct / att * 100 if att else 0
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Positive Score", f"+{result.pos_score:.1f}")
+    m2.metric("Negative Score", f"−{result.neg_score:.1f}")
+    m3.metric("Net Score", f"{result.total_score:.1f}")
+    m4.metric("Accuracy", f"{acc:.1f}%")
+    
+    info_rows = ''.join(
+        f'<div style="display:flex;justify-content:space-between;font-size:.85rem;padding:3px 0;">'
+        f'<span>{l}</span><span style="font-weight:700;">{v}</span></div>'
+        for l,v in [("Attempted",f"{att}/60 ({att/60*100:.0f}%)"),
+                    ("Unattempted",str(result.unattempted)),
+                    ("Multi-marked",str(result.multi))])
+    st.markdown(f'<div style="background:var(--sf2);border:1px solid var(--br);border-radius:10px;'
+                f'padding:13px 16px;margin-top:10px;"><div style="font-size:.68rem;color:var(--mu);'
+                f'text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px;">Summary</div>'
+                f'{info_rows}</div>', unsafe_allow_html=True)
+                
+    if show_debug and result.debug_log:
+        html = "".join(f'<div class="{"ok" if "[OK]" in l else "warn" if "[WARN]" in l else "err" if "[ERR]" in l else "info"}">{l}</div>'
+                       for l in result.debug_log)
+        st.markdown(f'<div class="dlog">{html}</div>', unsafe_allow_html=True)
 
-    with cr:
-        st.markdown("**🎯 Annotated OMR Sheet**")
-        if st.session_state.annotated_img is not None:
-            ann = cv2.cvtColor(st.session_state.annotated_img, cv2.COLOR_BGR2RGB)
-            st.image(ann, use_container_width=True)
-            buf = io.BytesIO()
-            Image.fromarray(ann).save(buf, 'PNG')
-            st.download_button("⬇️ Download Annotated OMR", buf.getvalue(),
-                               "annotated_omr.png", "image/png", use_container_width=True)
 
     st.divider()
     st.markdown('<div class="sh"><div class="sdot"></div><h3>Question-wise Report</h3></div>',
                 unsafe_allow_html=True)
     filt = st.multiselect("Filter by status",
-                          ['correct','wrong','unattempted','multi','answered'],
-                          default=['correct','wrong','unattempted','multi','answered'])
+                          ['correct','wrong','unattempted','multi'],
+                          default=['correct','wrong','unattempted','multi'])
     filtered = [b for b in result.bubbles if b.status in filt]
 
     rows_html = ""
@@ -609,8 +599,8 @@ if st.session_state.result is not None:
         key  = b.answer_key or '—'
         sc   = f"+{b.score:.0f}" if b.score>0 else (f"{b.score:.0f}" if b.score<0 else "0")
         sclr = "cg" if b.score>0 else ("cr" if b.score<0 else "ca")
-        bcls = {'correct':'bs-c','wrong':'bs-w','unattempted':'bs-s','multi':'bs-m','answered':'bs-b'}.get(b.status,'')
-        bico = {'correct':'✓','wrong':'✗','unattempted':'—','multi':'×','answered':'●'}.get(b.status,'')
+        bcls = {'correct':'bs-c','wrong':'bs-w','unattempted':'bs-s','multi':'bs-m'}.get(b.status,'')
+        bico = {'correct':'✓','wrong':'✗','unattempted':'—','multi':'×'}.get(b.status,'')
         fv_td = (f"<td style='font-size:.69rem;color:var(--mu);font-family:JetBrains Mono,monospace;"
                  f"white-space:nowrap;'>{'  '.join(f'{k}:{v:.2f}' for k,v in sorted(b.fill_values.items()))}</td>"
                  if show_fills else "")
@@ -641,6 +631,5 @@ if st.session_state.result is not None:
 st.markdown("""
 <div style="text-align:center;padding:28px 0 10px;color:var(--mu);font-size:.77rem;">
   <div class="tricolor" style="max-width:130px;margin:0 auto 10px;"><div></div><div></div><div></div></div>
-  Yuva Gyan Mahotsav 2026 · Tiranga Yuva Samiti · OMR Grader v8.0<br>
-  <span style="font-size:.67rem;opacity:.5;">■ A○ B○ C○ D○ ■ · Pixel-verified grid · Clean aligned annotation</span>
+  Yuva Gyan Mahotsav 2026 · Tiranga Yuva Samiti · OMR Grader
 </div>""", unsafe_allow_html=True)
