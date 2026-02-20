@@ -6,3 +6,4 @@ imutils
 pyzbar
 scipy
 PyMuPDF
+sklearn
