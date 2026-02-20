@@ -1,227 +1,121 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
+import imutils
+from imutils import contours
 
-st.set_page_config(layout="wide")
-st.title("YUVA GYAN MAHOTSAV 2026 - OMR AUTO GRADER")
+# --- CONFIGURATION ---
+ANSWER_KEY = {
+    1: 0, 2: 1, 3: 2, 4: 3, 5: 0, 6: 1, 7: 2, 8: 3, 9: 0, 10: 1,
+    11: 2, 12: 3, 13: 0, 14: 1, 15: 2, 16: 3, 17: 0, 18: 1, 19: 2, 20: 3,
+    21: 0, 22: 1, 23: 2, 24: 3, 25: 0, 26: 1, 27: 2, 28: 3, 29: 0, 30: 1,
+    31: 2, 32: 3, 33: 0, 34: 1, 35: 2, 36: 3, 37: 0, 38: 1, 39: 2, 40: 3,
+    41: 0, 42: 1, 43: 2, 44: 3, 45: 0, 46: 1, 47: 2, 48: 3, 49: 0, 50: 1,
+    51: 2, 52: 3, 53: 0, 54: 1, 55: 2, 56: 3, 57: 0, 58: 1, 59: 2, 60: 3
+}
 
-# ================= ANSWER KEY =================
-ANSWER_KEY = [
-'A','C','D','A','C','A','C','B','D','D','C','A','D','D','A','D','A','A','C','B',
-'D','B','D','C','B','A','D','A','B','A','C','B','C','D','A','C','D','B','A','D',
-'A','C','D','A','B','A','A','C','D','D','D','A','D','A','D','C','B','C','D','C'
-]
+def grade_omr(image_bytes):
+    # Convert uploaded web file to an OpenCV image
+    file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
+    image = cv2.imdecode(file_bytes, 1)
 
-POS_MARK = 3
-NEG_MARK = -1
-OPTIONS = ['A','B','C','D']
-
-# ================ PERSPECTIVE =================
-def order_points(pts):
-    rect = np.zeros((4,2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-def four_point_transform(image, pts):
-    rect = order_points(pts)
-    (tl,tr,br,bl) = rect
-    widthA = np.linalg.norm(br-bl)
-    widthB = np.linalg.norm(tr-tl)
-    maxWidth = int(max(widthA,widthB))
-    heightA = np.linalg.norm(tr-br)
-    heightB = np.linalg.norm(tl-bl)
-    maxHeight = int(max(heightA,heightB))
-    dst = np.array([
-        [0,0],
-        [maxWidth-1,0],
-        [maxWidth-1,maxHeight-1],
-        [0,maxHeight-1]], dtype="float32")
-    M = cv2.getPerspectiveTransform(rect,dst)
-    return cv2.warpPerspective(image,M,(maxWidth,maxHeight))
-
-# ============== ANCHOR DETECTION ==============
-def detect_anchors_and_warp(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    thr = cv2.threshold(gray, 80,255,cv2.THRESH_BINARY_INV)[1]
-    cnts,_ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
 
-    anchors = []
+    cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = imutils.grab_contours(cnts)
+    question_cnts = []
+
     for c in cnts:
-        area = cv2.contourArea(c)
-        if 500 < area < 5000:
-            x,y,w,h = cv2.boundingRect(c)
-            aspect = w/float(h)
-            if 0.8 < aspect < 1.2:
-                anchors.append((x,y,w,h))
+        (x, y, w, h) = cv2.boundingRect(c)
+        ar = w / float(h)
+        if w >= 15 and h >= 15 and 0.8 <= ar <= 1.2:
+            question_cnts.append(c)
 
-    if len(anchors) < 4:
-        return image
+    # Sort into 3 columns
+    boxes = [cv2.boundingRect(c) for c in question_cnts]
+    min_x = min([b[0] for b in boxes])
+    max_x = max([b[0] + b[2] for b in boxes])
+    col_width = (max_x - min_x) / 3
 
-    anchors = sorted(anchors, key=lambda b:(b[1],b[0]))
+    col1, col2, col3 = [], [], []
+    for c in question_cnts:
+        x = cv2.boundingRect(c)[0]
+        if x < min_x + col_width:
+            col1.append(c)
+        elif x < min_x + (2 * col_width):
+            col2.append(c)
+        else:
+            col3.append(c)
 
-    tl = anchors[0]
-    tr = anchors[1]
-    bl = anchors[-2]
-    br = anchors[-1]
+    columns = [col1, col2, col3]
+    correct, incorrect, unattempted = 0, 0, 0
+    current_question = 1
 
-    pts = np.array([
-        [tl[0], tl[1]],
-        [tr[0]+tr[2], tr[1]],
-        [br[0]+br[2], br[1]+br[3]],
-        [bl[0], bl[1]+bl[3]]
-    ], dtype="float32")
+    for col_cnts in columns:
+        if len(col_cnts) == 0: continue
+        col_cnts = contours.sort_contours(col_cnts, method="top-to-bottom")[0]
 
-    return four_point_transform(image, pts)
+        for (q, i) in enumerate(np.arange(0, len(col_cnts), 4)):
+            if i + 4 > len(col_cnts): break
+            cnts_row = contours.sort_contours(col_cnts[i:i + 4], method="left-to-right")[0]
+            bubbled = None
 
-# =============== MCQ REGION ===================
-def get_answer_region(warped):
-    h, w = warped.shape[:2]
-    top    = int(h*0.26)
-    bottom = int(h*0.83)
-    left   = int(w*0.06)
-    right  = int(w*0.94)
-    return warped[top:bottom, left:right]
+            for (j, c) in enumerate(cnts_row):
+                mask = np.zeros(thresh.shape, dtype="uint8")
+                cv2.drawContours(mask, [c], -1, 255, -1)
+                mask = cv2.bitwise_and(thresh, thresh, mask=mask)
+                total = cv2.countNonZero(mask)
 
-# =============== THRESHOLD ====================
-def preprocess(region):
-    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray,(5,5),0)
-    thr = cv2.adaptiveThreshold(
-        blur, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 15, 5)
-    
-    # Apply morphological closing to solidify grainy pencil marks
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel)
-    
-    return thr
+                if bubbled is None or total > bubbled[0]:
+                    bubbled = (total, j)
 
-# ============ GRID SPLIT ======================
-def split_columns(region):
-    h,w = region.shape[:2]
-    col_w = w//3
-    return [region[:,i*col_w:(i+1)*col_w] for i in range(3)]
-
-def detect_bubbles(col):
-    h, w = col.shape
-    rows = 20
-    opts = 4
-    row_h = h // rows
-    opt_w = w // opts
-
-    answers = []
-    status = []
-
-    for r in range(rows):
-        vals = []
-        for o in range(opts):
-            y1 = r * row_h
-            y2 = (r + 1) * row_h
-            x1 = o * opt_w
-            x2 = (o + 1) * opt_w
-
-            # ADD MARGINS: Focus on the center of the cell
-            margin_y = int(row_h * 0.15)
-            margin_x = int(opt_w * 0.15)
-
-            cell = col[y1+margin_y : y2-margin_y, x1+margin_x : x2-margin_x]
+            color = (0, 0, 255) # Red for incorrect
+            if bubbled[0] < 200: 
+                unattempted += 1
+                color = (0, 255, 255) # Yellow for unattempted
+            else:
+                correct_answer = ANSWER_KEY.get(current_question, -1)
+                if bubbled[1] == correct_answer:
+                    correct += 1
+                    color = (0, 255, 0) # Green for correct
+                else:
+                    incorrect += 1
+                cv2.drawContours(image, [cnts_row[bubbled[1]]], -1, color, 3)
             
-            # Safety check for extremely small crops
-            if cell.size == 0:
-                vals.append(0)
-                continue
+            if bubbled[0] >= 200 and bubbled[1] != correct_answer and correct_answer != -1:
+                 cv2.drawContours(image, [cnts_row[correct_answer]], -1, (255, 0, 0), 2)
+                 
+            current_question += 1
 
-            total = cv2.countNonZero(cell)
-            area = cell.shape[0] * cell.shape[1]
-            ratio = total / float(area)
+    score = (correct * 3) + (incorrect * -1)
+    
+    # Convert OpenCV image (BGR) to Streamlit image (RGB)
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    return score, correct, incorrect, unattempted, image_rgb
 
-            vals.append(ratio)
+# --- STREAMLIT WEB UI ---
+st.set_page_config(page_title="OMR Auto-Grader", layout="centered")
+st.title("📄 OMR Auto-Grader")
+st.markdown("Upload a scanned OMR sheet to automatically grade it.")
 
-        # RELATIVE THRESHOLDING
-        MIN_ATTEMPT_THRESH = 0.20 
-        filled = [i for i, v in enumerate(vals) if v > MIN_ATTEMPT_THRESH]
+uploaded_file = st.file_uploader("Upload OMR Image (JPG/PNG)", type=["jpg", "png", "jpeg"])
 
-        if len(filled) == 0:
-            answers.append(None)
-            status.append("UNATTEMPTED")
-        elif len(filled) == 1:
-            answers.append(filled[0])
-            status.append("OK")
-        else:
-            # Check for poor erasures by comparing densities
-            sorted_indices = np.argsort(vals)[::-1]
-            top_val = vals[sorted_indices[0]]
-            second_val = vals[sorted_indices[1]]
-
-            # If the second highest is >60% as dense as the highest, it's a true double mark
-            if second_val > (top_val * 0.60):
-                answers.append(None)
-                status.append("MULTIPLE")
-            else:
-                answers.append(sorted_indices[0])
-                status.append("OK")
-
-    return answers, status
-
-# ================= STREAMLIT ==================
-upload = st.file_uploader("Upload OMR Image", type=['jpg','jpeg','png'])
-
-if upload:
-    img = Image.open(upload).convert('RGB')
-    img_np = np.array(img)
-    img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-
-    warped = detect_anchors_and_warp(img_cv)
-
-    region = get_answer_region(warped)
-    thr = preprocess(region)
-
-    cols = split_columns(thr)
-
-    all_ans = []
-    all_stat = []
-
-    for c in cols:
-        a, s = detect_bubbles(c)
-        all_ans.extend(a)
-        all_stat.extend(s)
-
-    correct = 0
-    incorrect = 0
-    unattempted = 0
-
-    for i in range(60):
-        if all_stat[i] == "UNATTEMPTED":
-            unattempted += 1
-        elif all_stat[i] == "MULTIPLE":
-            incorrect += 1
-        else:
-            if OPTIONS[all_ans[i]] == ANSWER_KEY[i]:
-                correct += 1
-            else:
-                incorrect += 1
-
-    pos = correct * POS_MARK
-    neg = incorrect * abs(NEG_MARK)
-    total = pos - neg
-
-    st.subheader("RESULT")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Correct", correct)
-    c2.metric("Incorrect", incorrect)
-    c3.metric("Unattempted", unattempted)
-
-    c4, c5, c6 = st.columns(3)
-    c4.metric("Positive Score", pos)
-    c5.metric("Negative Score", neg)
-    c6.metric("Total Score", total)
-
-    st.image(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB),
-             caption="Aligned OMR", use_container_width=True)
+if uploaded_file is not None:
+    with st.spinner("Grading OMR Sheet..."):
+        # Pass the uploaded file to our OpenCV function
+        score, correct, incorrect, unattempted, graded_img = grade_omr(uploaded_file.read())
+        
+        # Display Results
+        st.success("Grading Complete!")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Score", f"{score}/180")
+        col2.metric("Correct (+3)", correct)
+        col3.metric("Incorrect (-1)", incorrect)
+        col4.metric("Unattempted", unattempted)
+        
+        # Display the visually graded image
+        st.image(graded_img, caption="Graded OMR Sheet", use_container_width=True)
