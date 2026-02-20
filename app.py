@@ -415,38 +415,25 @@ for k, v in {'answer_key': initial_answer_key,
 
 engine = OMREngine()
 
+# Hardcoded background variables to ensure engine continues to run
+pos_mark = 3.0
+neg_mark = 1.0
+show_debug = False
+show_fills = False
+
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="hdr">
   <div class="tricolor"><div></div><div></div><div></div></div>
   <h1 class="htitle">🎓 Yuva Gyan Mahotsav 2026</h1>
   <p class="hsub">Precision OMR Grader v8.0 &nbsp;·&nbsp; Tiranga Yuva Samiti</p>
-  <span class="pill pill-g">■ Pixel-Verified Grid</span>&nbsp;
-  <span class="pill pill-o">○ Relative Darkness Detection</span>&nbsp;
-  <span class="pill pill-b">Clean Aligned Annotation</span>
 </div>
 """, unsafe_allow_html=True)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ Marking Scheme")
-    pos_mark = st.number_input("✅ Correct (+)", 0.5, 10.0, 3.0, 0.5)
-    neg_mark = st.number_input("❌ Wrong (−)",   0.0,  5.0, 1.0, 0.5)
-    st.divider()
-    show_debug = st.checkbox("Show debug log", False)
-    show_fills = st.checkbox("Show raw fill values", False)
-    st.divider()
     st.markdown("### 📋 Answer Key")
-    bulk = st.text_area("Paste 60 answers (comma-separated)",
-                        placeholder="B,B,B,C,C,A,...", height=70)
-    if st.button("✅ Apply Bulk Key", use_container_width=True):
-        parts = [p.strip().upper() for p in bulk.split(',')]
-        for i, a in enumerate(parts[:60]):
-            if a in list('ABCD') + ['']:
-                st.session_state.answer_key[i + 1] = a
-        st.success("Key applied!")
     opts = ['', 'A', 'B', 'C', 'D']
-    st.caption("Or set individually:")
     kc = st.columns(2)
     for q in range(1, 61):
         with kc[0] if q % 2 else kc[1]:
