@@ -266,10 +266,11 @@ class OMRResult:
     total_score: float = 0
     student_info: dict = field(default_factory=dict)
 
-# ─── OMR Engine ──────────────────────────────────────────────────────────────
+# ─── OMR Engine (ULTRA PRO GRID INTERPOLATOR) ────────────────────────────────
 class OMREngine:
     """
-    Detects bubbles from the Yuva Gyan Mahotsav OMR sheet using machine reading squares.
+    Industrial-grade OMR engine. Uses machine timing marks to create an immutable 
+    mathematical grid, entirely bypassing issues with text detection and erased bubbles.
     """
 
     def pdf_to_image(self, pdf_bytes: bytes, dpi: int = 200) -> np.ndarray:
@@ -285,25 +286,25 @@ class OMREngine:
 
     def preprocess(self, img: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (7, 7), 0)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
         _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        # Solidify shapes to ensure timing marks aren't broken
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
         return thresh
 
     def detect_bubbles(self, img: np.ndarray) -> list:
-        # Now identifies ALL valid shapes (both machine squares and circles)
         thresh = self.preprocess(img)
         contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         features = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < 30 or area > 6000:
+            if area < 30 or area > 8000:
                 continue
             (x, y, w, h) = cv2.boundingRect(cnt)
             aspect = w / float(h)
-            if not (0.4 < aspect < 2.5):
+            if not (0.2 < aspect < 5.0): # Extremely forgiving aspect ratio
                 continue
             if w < 5 or h < 5:
                 continue
@@ -313,110 +314,112 @@ class OMREngine:
         return features
 
     def cluster_bubbles_grid(self, features: list, img_shape: tuple) -> dict:
-        """
-        Groups utilizing the Machine Reading Squares printed to the left of each question.
-        Ignores question text sitting between the square and the bubbles.
-        """
         if not features: return {}
 
         H, W = img_shape[:2]
-        # Ignore header and footer zones entirely
-        margin_top = int(H * 0.10)
+        # Ignore top 15% (Title/Instructions) and bottom 10% (Signatures)
+        margin_top = int(H * 0.15)
         margin_bot = int(H * 0.90)
         features = [f for f in features if margin_top < f['y'] < margin_bot]
         if not features: return {}
 
-        # 1. Split into 3 main columns based on X geometry
-        col_width = W / 3.0
+        # 1. Strictly segment into 3 equal columns
+        col_w = W / 3.0
         cols = [[], [], []]
         for f in features:
-            if f['x'] < col_width: cols[0].append(f)
-            elif f['x'] < 2 * col_width: cols[1].append(f)
+            if f['x'] < col_w: cols[0].append(f)
+            elif f['x'] < 2 * col_w: cols[1].append(f)
             else: cols[2].append(f)
 
         question_map = {}
-        q = 1
 
-        sizes = [f['h'] for f in features]
-        y_thresh = max(np.median(sizes) * 1.5, 10)
+        # 2. Process Column by Column
+        for col_idx, col_feats in enumerate(cols):
+            q_start = (col_idx * 20) + 1 # Force correct numbering per column
+            q = q_start
+            
+            if not col_feats:
+                continue
 
-        # 2. Process each column individually
-        for col_feats in cols:
-            if not col_feats: continue
-
-            # Group into rows by Y coordinate
+            # Group into rows
             col_feats.sort(key=lambda f: f['y'])
+            y_thresh = max(np.median([f['h'] for f in col_feats]) * 1.5, 12) if col_feats else 12
+
             rows = []
-            current_row = [col_feats[0]]
+            curr = [col_feats[0]]
             for f in col_feats[1:]:
-                row_y = np.mean([item['y'] for item in current_row])
-                if abs(f['y'] - row_y) < y_thresh:
-                    current_row.append(f)
+                if abs(f['y'] - np.mean([item['y'] for item in curr])) < y_thresh:
+                    curr.append(f)
                 else:
-                    rows.append(current_row)
-                    current_row = [f]
-            rows.append(current_row)
+                    rows.append(curr)
+                    curr = [f]
+            rows.append(curr)
 
-            # Filter out random stray lines by requiring rows to have enough items
-            valid_rows = [r for r in rows if len(r) >= 5] 
-
-            # Learn standard spacing from a clean row. 
-            # We assume: Leftmost = Square, Rightmost 4 = A, B, C, D
-            ref_dx = [70, 110, 150, 190] # Fallback pixel distances
-            for r in valid_rows:
+            # Find the Anchor (Timing Mark) for each row
+            # It should be the leftmost solid item
+            candidate_rows = []
+            for r in rows:
                 r.sort(key=lambda f: f['x'])
-                if len(r) >= 5:
-                    anchor = r[0]
-                    bubbles = r[-4:] # Ignore text/noise in the middle, just take the 4 rightmost
-                    ref_dx = [
-                        bubbles[0]['x'] - anchor['x'],
-                        bubbles[1]['x'] - anchor['x'],
-                        bubbles[2]['x'] - anchor['x'],
-                        bubbles[3]['x'] - anchor['x']
-                    ]
-                    break
+                candidate_rows.append(r)
 
-            # Map the options anchoring strictly to the left-most machine reading square
-            for row in rows: # Go through all rows again, even those missing bubbles
-                if q > 60: break
-                if len(row) < 2: continue # Ignore entirely empty rows
+            if not candidate_rows: continue
 
-                row.sort(key=lambda f: f['x'])
-                
-                # The leftmost item is the machine reading square
-                marker = row[0]
-                opts = {'marker': marker}
-                
-                # Grab the rightmost items as the bubbles (max 4)
-                potential_bubbles = row[1:]
-                
-                if len(potential_bubbles) >= 4:
-                    bubbles = potential_bubbles[-4:]
-                    opts['A'] = bubbles[0]
-                    opts['B'] = bubbles[1]
-                    opts['C'] = bubbles[2]
-                    opts['D'] = bubbles[3]
-                else:
-                    # Mathematical Interpolation: if a student erased so hard the circle is gone,
-                    # we use the learned distances from the square to locate A,B,C,D perfectly.
-                    w, h = marker['w'], marker['h']
-                    cy = marker['y']
-                    for i, opt in enumerate(['A', 'B', 'C', 'D']):
-                        cx = int(marker['x'] + ref_dx[i])
-                        opts[opt] = {
-                            'x': cx, 'y': int(cy), 'w': int(w), 'h': int(h),
-                            'bbox': (int(cx - w//2), int(cy - h//2), int(w), int(h))
-                        }
-                
+            # Filter rows to ensure the anchor is vertically aligned with the column edge
+            median_anchor_x = np.median([r[0]['x'] for r in candidate_rows])
+            valid_rows = [r for r in candidate_rows if abs(r[0]['x'] - median_anchor_x) < (col_w * 0.15)]
+            
+            # Keep top 20 rows max
+            valid_rows.sort(key=lambda r: r[0]['y'])
+            valid_rows = valid_rows[:20]
+
+            # Learn expected distances from Anchor -> Bubbles (A, B, C, D)
+            all_dxs = []
+            bw, bh = 0, 0
+            for r in valid_rows:
+                anchor = r[0]
+                # Filter out text/noise right next to the anchor, look for the 4 rightmost distinct shapes
+                to_right = [f for f in r if f['x'] > anchor['x'] + anchor['w'] * 1.5]
+                if len(to_right) >= 4:
+                    bubbles = to_right[-4:] # A, B, C, D
+                    dxs = [b['x'] - anchor['x'] for b in bubbles]
+                    all_dxs.append(dxs)
+                    bw = np.median([b['w'] for b in bubbles])
+                    bh = np.median([b['h'] for b in bubbles])
+
+            if all_dxs:
+                ref_dx = np.median(all_dxs, axis=0)
+            else:
+                # Fallback purely mathematical if standard learning fails
+                ref_dx = [col_w * 0.35, col_w * 0.50, col_w * 0.65, col_w * 0.80]
+                bw, bh = valid_rows[0][0]['w'], valid_rows[0][0]['h']
+
+            if bw == 0: bw = 15
+            if bh == 0: bh = 15
+
+            # GENERATE STRICT GRID - Overrides completely missing/erased bubbles
+            for r in valid_rows:
+                if q >= q_start + 20: break
+                anchor = r[0]
+                opts = {'marker': anchor}
+
+                for i, opt in enumerate(['A', 'B', 'C', 'D']):
+                    cx = int(anchor['x'] + ref_dx[i])
+                    cy = int(anchor['y'])
+                    w, h = int(bw), int(bh)
+                    # Bounding box is exactly where the bubble is mathematically expected to be
+                    opts[opt] = {
+                        'x': cx, 'y': cy, 'w': w, 'h': h,
+                        'bbox': (int(cx - w//2), int(cy - h//2), int(w), int(h))
+                    }
                 question_map[q] = opts
                 q += 1
 
         return question_map
 
     def measure_fill(self, img: np.ndarray, bubble: dict, thresh: np.ndarray) -> float:
-        """Returns fill ratio (0=empty, 1=fully filled) for a bubble."""
         x, y, w, h = bubble['bbox']
-        pad = 2
+        # Add padding to allow slight scanner skew
+        pad = 4
         x1, y1 = max(0, x - pad), max(0, y - pad)
         x2, y2 = min(thresh.shape[1], x + w + pad), min(thresh.shape[0], y + h + pad)
         roi = thresh[y1:y2, x1:x2]
@@ -425,11 +428,7 @@ class OMREngine:
         return np.count_nonzero(roi) / roi.size
 
     def classify_bubbles(self, img: np.ndarray, question_map: dict,
-                         fill_thresh: float = 0.28,
-                         multi_thresh: float = 0.28) -> dict:
-        """
-        Determine which bubbles are filled based only on the A/B/C/D mapping.
-        """
+                         fill_thresh: float = 0.28) -> dict:
         thresh = self.preprocess(img)
         results = {}
         for q, opts in question_map.items():
@@ -444,10 +443,7 @@ class OMREngine:
     def grade(self, img: np.ndarray, answer_key: dict,
               pos: float = 3.0, neg: float = 1.0,
               fill_thresh: float = 0.28) -> tuple:
-        """
-        Full grading pipeline.
-        Returns (OMRResult, annotated_img)
-        """
+        
         bubbles_raw = self.detect_bubbles(img)
         question_map = self.cluster_bubbles_grid(bubbles_raw, img.shape)
         bubble_results_raw = self.classify_bubbles(img, question_map, fill_thresh)
@@ -461,7 +457,6 @@ class OMREngine:
             selected = raw['selected']
             opts_map = question_map.get(q, {})
 
-            # Determine status
             if len(selected) == 0:
                 status = 'unattempted'
                 score = 0
@@ -479,59 +474,47 @@ class OMREngine:
                 score = 0
 
             br = BubbleResult(
-                q_num=q,
-                detected=selected,
-                answer_key=key,
-                status=status,
-                score=score
+                q_num=q, detected=selected, answer_key=key, status=status, score=score
             )
             results.append(br)
 
-            # Annotate machine reading square first
+            # --- Visualizing the Grid ---
             marker = opts_map.get('marker')
             if marker:
                 mx, my, mw, mh = marker['bbox']
                 cv2.rectangle(annotated, (mx, my), (mx+mw, my+mh), (0, 107, 255), 2) # Saffron box
 
-            # Annotate bubbles
             for opt in ['A', 'B', 'C', 'D']:
                 if opt not in opts_map: continue
                 bubble = opts_map[opt]
                 
                 cx, cy = bubble['x'], bubble['y']
-                r = max(bubble['w'], bubble['h']) // 2 + 3
+                bx, by, bw, bh = bubble['bbox']
+                
+                # Draw the strictly interpolated target detection zone (Light Blue)
+                cv2.rectangle(annotated, (bx-2, by-2), (bx+bw+2, by+bh+2), (255, 230, 200), 1)
+
+                r = max(bw, bh) // 2 + 1
 
                 if opt in selected:
-                    # Filled bubble colors
-                    if status == 'correct':
-                        color = (74, 163, 22)   # Green for correct
-                    elif status == 'wrong':
-                        color = (38, 38, 220)   # Red for wrong
-                    elif status == 'multi':
-                        color = (234, 51, 147)  # Purple for multiple
-                    else:
-                        color = (6, 119, 217)   # Amber/Orange for un-keyed fill
+                    if status == 'correct': color = (74, 163, 22)   
+                    elif status == 'wrong': color = (38, 38, 220)   
+                    elif status == 'multi': color = (234, 51, 147)  
+                    else: color = (6, 119, 217)   
                         
                     cv2.circle(annotated, (cx, cy), r, color, -1)
-                    cv2.circle(annotated, (cx, cy), r+2, color, 2)
-                    # Option label in white over filled color
-                    cv2.putText(annotated, opt, (cx-5, cy+5),
+                    cv2.putText(annotated, opt, (cx-4, cy+4),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,255,255), 1)
                 else:
-                    # Unfilled - gray outline
-                    cv2.circle(annotated, (cx, cy), r, (160, 160, 160), 2)
+                    cv2.circle(annotated, (cx, cy), r, (180, 180, 180), 1)
 
-                # Mark correct answer with a thick green ring if missed
                 if key == opt and opt not in selected and status != 'correct':
-                    cv2.circle(annotated, (cx, cy), r+5, (74, 163, 22), 2)
+                    cv2.circle(annotated, (cx, cy), r+4, (74, 163, 22), 2)
 
-            # Question number label drawn strictly using the marker
             if marker:
-                cv2.putText(annotated, str(q),
-                            (marker['x'] - 30, marker['y'] + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (50, 50, 50), 1)
+                cv2.putText(annotated, str(q), (marker['x'] - 25, marker['y'] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (50, 50, 50), 1)
 
-        # Tally
         correct = sum(1 for r in results if r.status == 'correct')
         wrong = sum(1 for r in results if r.status == 'wrong')
         unattempted = sum(1 for r in results if r.status == 'unattempted')
@@ -541,19 +524,12 @@ class OMREngine:
         total = pos_score - neg_score
 
         omr_result = OMRResult(
-            bubbles=results,
-            correct=correct,
-            wrong=wrong,
-            unattempted=unattempted,
-            multi=multi,
-            pos_score=pos_score,
-            neg_score=neg_score,
-            total_score=total
+            bubbles=results, correct=correct, wrong=wrong, unattempted=unattempted,
+            multi=multi, pos_score=pos_score, neg_score=neg_score, total_score=total
         )
         return omr_result, annotated
 
 # ─── Session State ───────────────────────────────────────────────────────────
-# Pre-fill answer key with random values automatically as requested
 if 'answer_key' not in st.session_state:
     st.session_state.answer_key = {i: random.choice(['A', 'B', 'C', 'D']) for i in range(1, 61)}
 if 'result' not in st.session_state:
@@ -657,7 +633,7 @@ if uploaded:
         if st.button("🚀 Grade OMR Sheet Now", use_container_width=True):
             progress = st.progress(0, text="Detecting anchors & bubbles...")
             time.sleep(0.3)
-            progress.progress(30, text="Clustering grid via Machine Squares...")
+            progress.progress(30, text="Projecting Mathematical Grid...")
             
             result, annotated = engine.grade(
                 img_cv,
