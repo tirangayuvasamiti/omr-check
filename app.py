@@ -11,6 +11,7 @@ from typing import Optional
 import tempfile
 import os
 import time
+import random
 
 # ─── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -33,16 +34,16 @@ st.markdown("""
     --green: #00A550;
     --gold: #FFB800;
     --white: #FFFFFF;
-    --bg: #0B1120;
-    --surface: #111827;
-    --surface2: #1F2937;
-    --border: #2D3748;
-    --text: #E5E7EB;
-    --muted: #9CA3AF;
-    --correct: #22C55E;
-    --wrong: #EF4444;
-    --skip: #F59E0B;
-    --multi: #A855F7;
+    --bg: #F8FAFC;         /* Light Background */
+    --surface: #FFFFFF;    /* White cards */
+    --surface2: #F1F5F9;   /* Light gray table headers */
+    --border: #E2E8F0;     /* Light border */
+    --text: #1E293B;       /* Dark text for visibility */
+    --muted: #64748B;      /* Muted dark gray */
+    --correct: #16A34A;
+    --wrong: #DC2626;
+    --skip: #D97706;
+    --multi: #9333EA;
 }
 
 html, body, [class*="css"] {
@@ -65,7 +66,7 @@ html, body, [class*="css"] {
 .omr-header::before {
     content: '';
     position: absolute; inset: 0;
-    background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.04'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+    background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.08'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
 }
 .omr-title {
     font-family: 'Rajdhani', sans-serif;
@@ -78,7 +79,7 @@ html, body, [class*="css"] {
 }
 .omr-subtitle {
     font-size: 0.95rem;
-    color: rgba(255,255,255,0.75);
+    color: rgba(255,255,255,0.9);
     margin-top: 6px;
     position: relative;
 }
@@ -102,16 +103,17 @@ html, body, [class*="css"] {
     text-align: center;
     position: relative;
     overflow: hidden;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
 }
 .stat-card::after {
     content: '';
     position: absolute; bottom: 0; left: 0; right: 0;
-    height: 3px;
+    height: 4px;
 }
 .stat-card.correct::after { background: var(--correct); }
 .stat-card.wrong::after   { background: var(--wrong); }
 .stat-card.skip::after    { background: var(--skip); }
-.stat-card.total::after   { background: var(--saffron); }
+.stat-card.total::after   { background: var(--multi); }
 .stat-card.score::after   { background: var(--gold); }
 .stat-num {
     font-family: 'Rajdhani', sans-serif;
@@ -125,12 +127,13 @@ html, body, [class*="css"] {
     text-transform: uppercase;
     letter-spacing: 1.5px;
     margin-top: 4px;
+    font-weight: 600;
 }
 .c-green { color: var(--correct); }
 .c-red   { color: var(--wrong); }
 .c-amber { color: var(--skip); }
 .c-orange { color: var(--saffron); }
-.c-gold  { color: var(--gold); }
+.c-gold  { color: #D97706; }
 .c-purple { color: var(--multi); }
 
 /* LEGEND CHIPS */
@@ -141,32 +144,34 @@ html, body, [class*="css"] {
     font-size: 0.78rem; font-weight: 600;
     border: 1px solid;
 }
-.chip-green  { background: rgba(34,197,94,0.15);  border-color: #22C55E; color: #22C55E; }
-.chip-red    { background: rgba(239,68,68,0.15);  border-color: #EF4444; color: #EF4444; }
-.chip-amber  { background: rgba(245,158,11,0.15); border-color: #F59E0B; color: #F59E0B; }
-.chip-purple { background: rgba(168,85,247,0.15); border-color: #A855F7; color: #A855F7; }
+.chip-green  { background: rgba(22,163,74,0.1);  border-color: #16A34A; color: #16A34A; }
+.chip-red    { background: rgba(220,38,38,0.1);  border-color: #DC2626; color: #DC2626; }
+.chip-amber  { background: rgba(217,119,6,0.1); border-color: #D97706; color: #D97706; }
+.chip-purple { background: rgba(147,51,234,0.1); border-color: #9333EA; color: #9333EA; }
+.chip-gray   { background: rgba(100,116,139,0.1); border-color: #64748B; color: #64748B; }
 
 /* BUBBLE TABLE */
-.bubble-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.bubble-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; background: var(--surface); }
 .bubble-table th {
     background: var(--surface2);
-    color: var(--muted);
+    color: var(--text);
     text-transform: uppercase;
-    font-size: 0.72rem;
+    font-size: 0.75rem;
+    font-weight: 700;
     letter-spacing: 1px;
-    padding: 10px 8px;
-    border-bottom: 1px solid var(--border);
+    padding: 12px 10px;
+    border-bottom: 2px solid var(--border);
 }
-.bubble-table td { padding: 7px 8px; border-bottom: 1px solid rgba(45,55,72,0.4); }
-.bubble-table tr:hover td { background: rgba(255,107,0,0.05); }
+.bubble-table td { padding: 10px; border-bottom: 1px solid var(--border); color: var(--text); }
+.bubble-table tr:hover td { background: rgba(255,107,0,0.03); }
 .badge {
-    display: inline-block; padding: 2px 10px;
+    display: inline-block; padding: 4px 10px;
     border-radius: 12px; font-size: 0.75rem; font-weight: 600;
 }
-.badge-correct  { background: rgba(34,197,94,0.2);  color: #22C55E; }
-.badge-wrong    { background: rgba(239,68,68,0.2);  color: #EF4444; }
-.badge-skip     { background: rgba(245,158,11,0.2); color: #F59E0B; }
-.badge-multi    { background: rgba(168,85,247,0.2); color: #A855F7; }
+.badge-correct  { background: rgba(22,163,74,0.15);  color: #16A34A; }
+.badge-wrong    { background: rgba(220,38,38,0.15);  color: #DC2626; }
+.badge-skip     { background: rgba(217,119,6,0.15); color: #D97706; }
+.badge-multi    { background: rgba(147,51,234,0.15); color: #9333EA; }
 
 /* UPLOAD AREA */
 .upload-zone {
@@ -186,20 +191,21 @@ section[data-testid="stSidebar"] {
 }
 section[data-testid="stSidebar"] .stSelectbox label,
 section[data-testid="stSidebar"] .stNumberInput label,
-section[data-testid="stSidebar"] label { color: var(--text) !important; }
+section[data-testid="stSidebar"] label { color: var(--text) !important; font-weight: 600;}
 
 /* Streamlit overrides */
 .stButton > button {
     background: linear-gradient(135deg, var(--saffron), var(--saffron-light));
-    color: white;
+    color: white !important;
     border: none;
     border-radius: 8px;
     padding: 10px 24px;
     font-weight: 600;
     font-family: 'Rajdhani', sans-serif;
-    font-size: 1rem;
+    font-size: 1.1rem;
     letter-spacing: 0.5px;
     transition: all 0.2s;
+    box-shadow: 0 4px 10px rgba(255,107,0,0.2);
 }
 .stButton > button:hover {
     background: linear-gradient(135deg, #e05e00, var(--saffron));
@@ -211,14 +217,12 @@ section[data-testid="stSidebar"] label { color: var(--text) !important; }
 .stTextInput > div > input,
 .stNumberInput > div > input,
 .stSelectbox > div > div {
-    background: var(--surface2) !important;
+    background: var(--surface) !important;
     border-color: var(--border) !important;
     color: var(--text) !important;
 }
-.stTab [data-baseweb="tab"] { color: var(--muted); }
-.stTab [aria-selected="true"] { color: var(--saffron) !important; border-bottom-color: var(--saffron) !important; }
 
-h1,h2,h3,h4 { font-family: 'Rajdhani', sans-serif; color: var(--text); }
+h1,h2,h3,h4 { font-family: 'Rajdhani', sans-serif; color: var(--text); font-weight: 700; }
 .stAlert { border-radius: 10px; }
 
 div[data-testid="column"] { gap: 8px; }
@@ -227,15 +231,17 @@ div[data-testid="column"] { gap: 8px; }
     border-radius: 12px;
     padding: 20px 28px;
     margin: 16px 0;
-    border-left: 5px solid;
+    border-left: 6px solid;
     font-family: 'Rajdhani', sans-serif;
-    font-size: 1.3rem;
-    font-weight: 600;
+    font-size: 1.4rem;
+    font-weight: 700;
+    background: var(--surface);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
 }
-.banner-excellent { background: rgba(34,197,94,0.1);  border-color: #22C55E; color: #22C55E; }
-.banner-good      { background: rgba(255,184,0,0.1);  border-color: #FFB800; color: #FFB800; }
-.banner-average   { background: rgba(245,158,11,0.1); border-color: #F59E0B; color: #F59E0B; }
-.banner-poor      { background: rgba(239,68,68,0.1);  border-color: #EF4444; color: #EF4444; }
+.banner-excellent { border-color: #16A34A; color: #16A34A; }
+.banner-good      { border-color: #D97706; color: #D97706; }
+.banner-average   { border-color: #EA580C; color: #EA580C; }
+.banner-poor      { border-color: #DC2626; color: #DC2626; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -351,8 +357,6 @@ class OMREngine:
 
         # Build question→options mapping
         # OMR has 3 columns of 20 questions, each with A B C D
-        # The 3 columns are side by side horizontally
-        # Sort each row by x, then group into sets of 4
         question_map = {}
         q = 1
         for row in valid_rows:
@@ -397,9 +401,6 @@ class OMREngine:
             fills = {}
             for opt, bubble in opts.items():
                 fills[opt] = self.measure_fill(img, bubble, thresh)
-            # Find max fill
-            max_fill = max(fills.values()) if fills else 0
-            # Options above threshold
             selected = [opt for opt, f in fills.items() if f >= fill_thresh]
             results[q] = {'selected': selected, 'fills': fills}
         return results
@@ -450,40 +451,41 @@ class OMREngine:
             )
             results.append(br)
 
-            # Annotate bubbles
+            # Annotate bubbles with clear specific colors for the light theme
             for opt, bubble in opts_map.items():
                 cx, cy = bubble['x'], bubble['y']
                 r = max(bubble['w'], bubble['h']) // 2 + 3
 
                 if opt in selected:
-                    # Filled bubble
+                    # Filled bubble colors
                     if status == 'correct':
-                        color = (34, 197, 94)   # green
+                        color = (74, 163, 22)   # Green for correct
                     elif status == 'wrong':
-                        color = (68, 68, 239)    # red-ish
+                        color = (38, 38, 220)   # Red for wrong
                     elif status == 'multi':
-                        color = (168, 85, 247)   # purple
+                        color = (234, 51, 147)  # Purple for multiple
                     else:
-                        color = (245, 158, 11)   # amber
+                        color = (6, 119, 217)   # Amber/Orange for un-keyed fill
+                        
                     cv2.circle(annotated, (cx, cy), r, color, -1)
                     cv2.circle(annotated, (cx, cy), r+2, color, 2)
-                    # Option label
+                    # Option label in white over filled color
                     cv2.putText(annotated, opt, (cx-5, cy+5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,255,255), 1)
                 else:
-                    # Unfilled - thin outline
-                    cv2.circle(annotated, (cx, cy), r, (80, 100, 120), 1)
+                    # Unfilled - gray outline
+                    cv2.circle(annotated, (cx, cy), r, (160, 160, 160), 2)
 
-                # Mark correct answer with a ★ or ring
+                # Mark correct answer with a thick green ring if missed
                 if key == opt and opt not in selected and status != 'correct':
-                    cv2.circle(annotated, (cx, cy), r+4, (34, 197, 94), 2)
+                    cv2.circle(annotated, (cx, cy), r+5, (74, 163, 22), 2)
 
-            # Question number label
+            # Question number label - Dark gray for visibility
             if opts_map:
                 first_b = list(opts_map.values())[0]
                 cv2.putText(annotated, str(q),
                             (first_b['x'] - 30, first_b['y'] + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 200, 200), 1)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (50, 50, 50), 1)
 
         # Tally
         correct = sum(1 for r in results if r.status == 'correct')
@@ -506,10 +508,10 @@ class OMREngine:
         )
         return omr_result, annotated
 
-
 # ─── Session State ───────────────────────────────────────────────────────────
+# Pre-fill answer key with random values automatically as requested
 if 'answer_key' not in st.session_state:
-    st.session_state.answer_key = {i: '' for i in range(1, 61)}
+    st.session_state.answer_key = {i: random.choice(['A', 'B', 'C', 'D']) for i in range(1, 61)}
 if 'result' not in st.session_state:
     st.session_state.result = None
 if 'original_img' not in st.session_state:
@@ -541,8 +543,8 @@ with st.sidebar:
                                help="Lower = more sensitive (detects lighter marks)")
     
     st.divider()
-    st.markdown("### 📋 Answer Key")
-    st.caption("Enter correct answers (A/B/C/D). Leave blank = no key for that Q.")
+    st.markdown("### 📋 Answer Key (Pre-filled Randomly)")
+    st.caption("Answers are pre-populated randomly for testing. You can edit them below.")
     
     # Bulk input
     bulk_key = st.text_area(
@@ -569,45 +571,46 @@ with st.sidebar:
                 key=f"key_{q}"
             )
 
-# ─── MAIN CONTENT ────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📤 Upload & Grade", "📊 Results Dashboard", "📋 Detailed Report"])
+# ─── MAIN CONTENT (Single Page Flow) ─────────────────────────────────────────
 
-with tab1:
-    st.markdown("### Upload OMR Sheet")
-    st.markdown("""
-    <div class="legend">
-      <span class="chip chip-green">🟢 Correct Answer</span>
-      <span class="chip chip-red">🔴 Wrong Answer</span>
-      <span class="chip chip-amber">🟡 Unattempted</span>
-      <span class="chip chip-purple">🟣 Multiple Marked</span>
-    </div>
-    """, unsafe_allow_html=True)
+st.markdown("### 📤 Upload & Grade OMR Sheet")
+st.markdown("""
+<div class="legend">
+  <span class="chip chip-green">🟢 Correct Answer</span>
+  <span class="chip chip-red">🔴 Wrong Answer</span>
+  <span class="chip chip-gray">⚪ Unfilled Option</span>
+  <span class="chip chip-amber">🟡 Unattempted/Missed</span>
+  <span class="chip chip-purple">🟣 Multiple Marked</span>
+</div>
+""", unsafe_allow_html=True)
+
+uploaded = st.file_uploader(
+    "Drop the OMR PDF or Image here",
+    type=['pdf', 'png', 'jpg', 'jpeg', 'tiff', 'bmp'],
+    help="Supports: PDF (scanned), PNG, JPG, TIFF"
+)
+
+if uploaded:
+    with st.spinner("🔍 Processing OMR sheet..."):
+        file_bytes = uploaded.read()
+        if uploaded.type == 'application/pdf':
+            img_cv = engine.pdf_to_image(file_bytes, dpi=200)
+        else:
+            pil_img = Image.open(io.BytesIO(file_bytes))
+            img_cv = engine.pil_to_cv(pil_img)
+        st.session_state.original_img = img_cv.copy()
     
-    uploaded = st.file_uploader(
-        "Drop the OMR PDF or Image here",
-        type=['pdf', 'png', 'jpg', 'jpeg', 'tiff', 'bmp'],
-        help="Supports: PDF (scanned), PNG, JPG, TIFF"
-    )
+    st.success(f"✅ File loaded: {uploaded.name} ({img_cv.shape[1]}×{img_cv.shape[0]}px)")
     
-    if uploaded:
-        with st.spinner("🔍 Processing OMR sheet..."):
-            file_bytes = uploaded.read()
-            if uploaded.type == 'application/pdf':
-                img_cv = engine.pdf_to_image(file_bytes, dpi=200)
-            else:
-                pil_img = Image.open(io.BytesIO(file_bytes))
-                img_cv = engine.pil_to_cv(pil_img)
-            st.session_state.original_img = img_cv.copy()
-        
-        st.success(f"✅ File loaded: {uploaded.name} ({img_cv.shape[1]}×{img_cv.shape[0]}px)")
-        
-        col_orig, col_grade = st.columns(2)
-        with col_orig:
-            st.markdown("#### 📄 Original OMR")
-            orig_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
-            st.image(orig_rgb, use_container_width=True)
-        
-        if st.button("🚀 Grade OMR Sheet", use_container_width=True):
+    col_orig, col_grade_btn = st.columns([1, 1])
+    with col_orig:
+        st.markdown("#### 📄 Original OMR")
+        orig_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+        st.image(orig_rgb, use_container_width=True)
+    
+    with col_grade_btn:
+        st.write("") # Spacer
+        if st.button("🚀 Grade OMR Sheet Now", use_container_width=True):
             progress = st.progress(0, text="Detecting bubbles...")
             time.sleep(0.3)
             progress.progress(30, text="Clustering grid...")
@@ -627,154 +630,150 @@ with tab1:
             time.sleep(0.3)
             progress.empty()
             
-            with col_grade:
-                st.markdown("#### 🎯 Graded OMR")
-                ann_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-                st.image(ann_rgb, use_container_width=True)
-            
-            st.success("✅ Grading complete! Switch to **Results Dashboard** tab.")
+            st.success("✅ Grading complete! Scroll down to see results.")
 
-with tab2:
+# ─── RESULTS DISPLAY (Shown sequentially on the same window) ────────────────
+if st.session_state.result is not None:
     result = st.session_state.result
-    if result is None:
-        st.info("⬆️ Upload and grade an OMR sheet first.")
+    
+    st.divider()
+    st.markdown("### 📊 Results Dashboard")
+    
+    # Score banner
+    total_q = 60
+    pct = (result.total_score / (total_q * pos_mark)) * 100 if total_q * pos_mark > 0 else 0
+    if pct >= 75:
+        banner_cls, grade_txt = "banner-excellent", "🏆 Outstanding Performance!"
+    elif pct >= 50:
+        banner_cls, grade_txt = "banner-good", "👍 Good Performance"
+    elif pct >= 35:
+        banner_cls, grade_txt = "banner-average", "📚 Average – Keep Practicing"
     else:
-        # Score banner
-        total_q = 60
-        pct = (result.total_score / (total_q * pos_mark)) * 100 if total_q * pos_mark > 0 else 0
-        if pct >= 75:
-            banner_cls, grade_txt = "banner-excellent", "🏆 Outstanding Performance!"
-        elif pct >= 50:
-            banner_cls, grade_txt = "banner-good", "👍 Good Performance"
-        elif pct >= 35:
-            banner_cls, grade_txt = "banner-average", "📚 Average – Keep Practicing"
-        else:
-            banner_cls, grade_txt = "banner-poor", "⚠️ Needs Improvement"
+        banner_cls, grade_txt = "banner-poor", "⚠️ Needs Improvement"
+    
+    st.markdown(f'<div class="result-banner {banner_cls}">{grade_txt} &nbsp;|&nbsp; Score: {result.total_score:.1f} / {total_q * pos_mark:.0f} &nbsp;|&nbsp; {pct:.1f}%</div>', unsafe_allow_html=True)
+    
+    # Stat cards
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.markdown(f'<div class="stat-card correct"><div class="stat-num c-green">{result.correct}</div><div class="stat-label">Correct</div></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown(f'<div class="stat-card wrong"><div class="stat-num c-red">{result.wrong}</div><div class="stat-label">Wrong</div></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown(f'<div class="stat-card skip"><div class="stat-num c-amber">{result.unattempted}</div><div class="stat-label">Skipped</div></div>', unsafe_allow_html=True)
+    with c4:
+        st.markdown(f'<div class="stat-card total"><div class="stat-num c-purple">{result.multi}</div><div class="stat-label">Multi-filled</div></div>', unsafe_allow_html=True)
+    with c5:
+        st.markdown(f'<div class="stat-card score"><div class="stat-num c-gold">{result.total_score:.1f}</div><div class="stat-label">Final Score</div></div>', unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    # Score breakdown & Annotated image side by side
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        st.markdown("#### 📉 Score Breakdown")
+        breakdown_data = {
+            'Component': ['Positive Score', 'Negative Score', 'Net Score'],
+            'Value': [f"+{result.pos_score:.1f}", f"−{result.neg_score:.1f}", f"{result.total_score:.1f}"]
+        }
+        df_break = pd.DataFrame(breakdown_data)
+        st.dataframe(df_break, hide_index=True, use_container_width=True)
         
-        st.markdown(f'<div class="result-banner {banner_cls}">{grade_txt} &nbsp;|&nbsp; Score: {result.total_score:.1f} / {total_q * pos_mark:.0f} &nbsp;|&nbsp; {pct:.1f}%</div>', unsafe_allow_html=True)
-        
-        # Stat cards
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1:
-            st.markdown(f'<div class="stat-card correct"><div class="stat-num c-green">{result.correct}</div><div class="stat-label">Correct</div></div>', unsafe_allow_html=True)
-        with c2:
-            st.markdown(f'<div class="stat-card wrong"><div class="stat-num c-red">{result.wrong}</div><div class="stat-label">Wrong</div></div>', unsafe_allow_html=True)
-        with c3:
-            st.markdown(f'<div class="stat-card skip"><div class="stat-num c-amber">{result.unattempted}</div><div class="stat-label">Skipped</div></div>', unsafe_allow_html=True)
-        with c4:
-            st.markdown(f'<div class="stat-card total"><div class="stat-num c-purple">{result.multi}</div><div class="stat-label">Multi-filled</div></div>', unsafe_allow_html=True)
-        with c5:
-            st.markdown(f'<div class="stat-card score"><div class="stat-num c-gold">{result.total_score:.1f}</div><div class="stat-label">Final Score</div></div>', unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        # Score breakdown
-        col_a, col_b = st.columns([1, 1])
-        with col_a:
-            st.markdown("#### 📊 Score Breakdown")
-            breakdown_data = {
-                'Component': ['Positive Score', 'Negative Score', 'Net Score'],
-                'Value': [f"+{result.pos_score:.1f}", f"−{result.neg_score:.1f}", f"{result.total_score:.1f}"]
-            }
-            df_break = pd.DataFrame(breakdown_data)
-            st.dataframe(df_break, hide_index=True, use_container_width=True)
+        st.markdown("#### 📈 Accuracy")
+        attempted = result.correct + result.wrong + result.multi
+        accuracy = (result.correct / attempted * 100) if attempted > 0 else 0
+        st.metric("Attempt Rate", f"{attempted}/60 ({attempted/60*100:.0f}%)")
+        st.metric("Accuracy (of attempted)", f"{accuracy:.1f}%")
+    
+    with col_b:
+        st.markdown("#### 🎯 Graded OMR Preview")
+        if st.session_state.annotated_img is not None:
+            ann_rgb = cv2.cvtColor(st.session_state.annotated_img, cv2.COLOR_BGR2RGB)
+            st.image(ann_rgb, use_container_width=True)
             
-            st.markdown("#### 📈 Accuracy")
-            attempted = result.correct + result.wrong + result.multi
-            accuracy = (result.correct / attempted * 100) if attempted > 0 else 0
-            st.metric("Attempt Rate", f"{attempted}/60 ({attempted/60*100:.0f}%)")
-            st.metric("Accuracy (of attempted)", f"{accuracy:.1f}%")
-        
-        with col_b:
-            st.markdown("#### 🖼️ Graded OMR Preview")
-            if st.session_state.annotated_img is not None:
-                ann_rgb = cv2.cvtColor(st.session_state.annotated_img, cv2.COLOR_BGR2RGB)
-                st.image(ann_rgb, use_container_width=True)
-            # Download button
-            if st.session_state.annotated_img is not None:
-                ann_pil = Image.fromarray(cv2.cvtColor(st.session_state.annotated_img, cv2.COLOR_BGR2RGB))
-                buf = io.BytesIO()
-                ann_pil.save(buf, format='PNG')
-                st.download_button("⬇️ Download Graded OMR", buf.getvalue(),
-                                   file_name="graded_omr.png", mime="image/png")
+            # Download button for annotated image
+            ann_pil = Image.fromarray(ann_rgb)
+            buf = io.BytesIO()
+            ann_pil.save(buf, format='PNG')
+            st.download_button("⬇️ Download Graded OMR", buf.getvalue(),
+                               file_name="graded_omr.png", mime="image/png", use_container_width=True)
 
-with tab3:
-    result = st.session_state.result
-    if result is None:
-        st.info("⬆️ Upload and grade an OMR sheet first.")
-    else:
-        st.markdown("### 📋 Question-wise Analysis")
+    st.divider()
+    
+    # ─── DETAILED REPORT ────────────────────────────────────────────────────────
+    st.markdown("### 📋 Detailed Question-wise Report")
+    
+    # Filters
+    filter_status = st.multiselect(
+        "Filter by status",
+        ['correct', 'wrong', 'unattempted', 'multi'],
+        default=['correct', 'wrong', 'unattempted', 'multi']
+    )
+    
+    filtered = [b for b in result.bubbles if b.status in filter_status]
+    
+    # Build HTML table for light theme
+    rows_html = ""
+    for b in filtered:
+        detected_str = ', '.join(b.detected) if b.detected else '—'
+        key_str = b.answer_key if b.answer_key else '—'
+        score_str = f"+{b.score:.0f}" if b.score > 0 else (f"{b.score:.0f}" if b.score != 0 else "0")
+        score_color = "c-green" if b.score > 0 else ("c-red" if b.score < 0 else "c-amber")
         
-        # Filter
-        filter_status = st.multiselect(
-            "Filter by status",
-            ['correct', 'wrong', 'unattempted', 'multi'],
-            default=['correct', 'wrong', 'unattempted', 'multi']
-        )
+        badge_map = {
+            'correct': 'badge-correct',
+            'wrong': 'badge-wrong',
+            'unattempted': 'badge-skip',
+            'multi': 'badge-multi'
+        }
+        badge_cls = badge_map.get(b.status, '')
+        status_label = b.status.upper()
         
-        filtered = [b for b in result.bubbles if b.status in filter_status]
-        
-        # Build HTML table
-        rows_html = ""
-        for b in filtered:
-            detected_str = ', '.join(b.detected) if b.detected else '—'
-            key_str = b.answer_key if b.answer_key else '—'
-            score_str = f"+{b.score:.0f}" if b.score > 0 else (f"{b.score:.0f}" if b.score != 0 else "0")
-            score_color = "c-green" if b.score > 0 else ("c-red" if b.score < 0 else "c-amber")
-            
-            badge_map = {
-                'correct': 'badge-correct',
-                'wrong': 'badge-wrong',
-                'unattempted': 'badge-skip',
-                'multi': 'badge-multi'
-            }
-            badge_cls = badge_map.get(b.status, '')
-            status_label = b.status.upper()
-            
-            rows_html += f"""
-            <tr>
-              <td style="font-weight:600; color:#E5E7EB;">Q{b.q_num}</td>
-              <td><span style="color:#60A5FA; font-weight:600;">{detected_str}</span></td>
-              <td><span style="color:#34D399; font-weight:600;">{key_str}</span></td>
-              <td><span class="badge {badge_cls}">{status_label}</span></td>
-              <td class="{score_color}" style="font-weight:700;">{score_str}</td>
-            </tr>"""
-        
-        table_html = f"""
-        <div style="max-height:500px; overflow-y:auto; border:1px solid #2D3748; border-radius:10px;">
-        <table class="bubble-table">
-          <thead>
-            <tr>
-              <th>Q#</th><th>Detected</th><th>Answer Key</th><th>Status</th><th>Score</th>
-            </tr>
-          </thead>
-          <tbody>{rows_html}</tbody>
-        </table>
-        </div>"""
-        st.markdown(table_html, unsafe_allow_html=True)
-        
-        # CSV Export
-        export_data = []
-        for b in result.bubbles:
-            export_data.append({
-                'Question': b.q_num,
-                'Detected': ', '.join(b.detected) if b.detected else '',
-                'Answer Key': b.answer_key,
-                'Status': b.status,
-                'Score': b.score
-            })
-        df_export = pd.DataFrame(export_data)
-        csv = df_export.to_csv(index=False)
-        st.download_button(
-            "⬇️ Download Results CSV",
-            csv,
-            file_name="omr_results.csv",
-            mime="text/csv"
-        )
+        rows_html += f"""
+        <tr>
+          <td style="font-weight:700;">Q{b.q_num}</td>
+          <td><span style="color:#2563EB; font-weight:700;">{detected_str}</span></td>
+          <td><span style="color:#059669; font-weight:700;">{key_str}</span></td>
+          <td><span class="badge {badge_cls}">{status_label}</span></td>
+          <td class="{score_color}" style="font-weight:800;">{score_str}</td>
+        </tr>"""
+    
+    table_html = f"""
+    <div style="max-height:500px; overflow-y:auto; border:1px solid var(--border); border-radius:10px; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
+    <table class="bubble-table">
+      <thead>
+        <tr>
+          <th>Q#</th><th>Detected</th><th>Answer Key</th><th>Status</th><th>Score</th>
+        </tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+    </div>"""
+    st.markdown(table_html, unsafe_allow_html=True)
+    
+    # CSV Export
+    st.write("") # Spacer
+    export_data = []
+    for b in result.bubbles:
+        export_data.append({
+            'Question': b.q_num,
+            'Detected': ', '.join(b.detected) if b.detected else '',
+            'Answer Key': b.answer_key,
+            'Status': b.status,
+            'Score': b.score
+        })
+    df_export = pd.DataFrame(export_data)
+    csv = df_export.to_csv(index=False)
+    st.download_button(
+        "⬇️ Download Results CSV",
+        csv,
+        file_name="omr_results.csv",
+        mime="text/csv"
+    )
 
 # ─── FOOTER ─────────────────────────────────────────────────────────────────
 st.markdown("""
-<div style="text-align:center; padding:24px 0 8px; color:#4B5563; font-size:0.8rem;">
+<div style="text-align:center; padding:30px 0 10px; color:var(--muted); font-size:0.85rem; font-weight:600;">
   <div class="tricolor-bar" style="max-width:200px; margin:0 auto 12px;"><div></div><div></div><div></div></div>
   Yuva Gyan Mahotsav 2026 · Tiranga Yuva Samiti · OMR Auto-Grader
 </div>
