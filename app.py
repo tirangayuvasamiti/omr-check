@@ -47,14 +47,11 @@ def four_point_transform(image, pts):
 
 # ============== ANCHOR DETECTION ==============
 def detect_anchors_and_warp(image):
-
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     thr = cv2.threshold(gray, 80,255,cv2.THRESH_BINARY_INV)[1]
-
     cnts,_ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     anchors = []
-
     for c in cnts:
         area = cv2.contourArea(c)
         if 500 < area < 5000:
@@ -84,15 +81,11 @@ def detect_anchors_and_warp(image):
 
 # =============== MCQ REGION ===================
 def get_answer_region(warped):
-
     h, w = warped.shape[:2]
-
     top    = int(h*0.26)
     bottom = int(h*0.83)
-
     left   = int(w*0.06)
     right  = int(w*0.94)
-
     return warped[top:bottom, left:right]
 
 # =============== THRESHOLD ====================
@@ -100,9 +93,14 @@ def preprocess(region):
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray,(5,5),0)
     thr = cv2.adaptiveThreshold(
-        blur,255,
+        blur, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,15,5)
+        cv2.THRESH_BINARY_INV, 15, 5)
+    
+    # Apply morphological closing to solidify grainy pencil marks
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel)
+    
     return thr
 
 # ============ GRID SPLIT ======================
@@ -112,105 +110,118 @@ def split_columns(region):
     return [region[:,i*col_w:(i+1)*col_w] for i in range(3)]
 
 def detect_bubbles(col):
-    h,w = col.shape
-    rows=20
-    opts=4
-    row_h = h//rows
-    opt_w = w//opts
+    h, w = col.shape
+    rows = 20
+    opts = 4
+    row_h = h // rows
+    opt_w = w // opts
 
-    answers=[]
-    status=[]
+    answers = []
+    status = []
 
     for r in range(rows):
-
-        vals=[]
-
+        vals = []
         for o in range(opts):
+            y1 = r * row_h
+            y2 = (r + 1) * row_h
+            x1 = o * opt_w
+            x2 = (o + 1) * opt_w
 
-            y1=r*row_h
-            y2=(r+1)*row_h
-            x1=o*opt_w
-            x2=(o+1)*opt_w
+            # ADD MARGINS: Focus on the center of the cell
+            margin_y = int(row_h * 0.15)
+            margin_x = int(opt_w * 0.15)
 
-            cell=col[y1:y2,x1:x2]
-            total=cv2.countNonZero(cell)
-            area=cell.shape[0]*cell.shape[1]
-            ratio=total/area
+            cell = col[y1+margin_y : y2-margin_y, x1+margin_x : x2-margin_x]
+            
+            # Safety check for extremely small crops
+            if cell.size == 0:
+                vals.append(0)
+                continue
+
+            total = cv2.countNonZero(cell)
+            area = cell.shape[0] * cell.shape[1]
+            ratio = total / float(area)
 
             vals.append(ratio)
 
-        filled=[i for i,v in enumerate(vals) if v>0.22]
+        # RELATIVE THRESHOLDING
+        MIN_ATTEMPT_THRESH = 0.20 
+        filled = [i for i, v in enumerate(vals) if v > MIN_ATTEMPT_THRESH]
 
-        if len(filled)==0:
+        if len(filled) == 0:
             answers.append(None)
             status.append("UNATTEMPTED")
-
-        elif len(filled)>1:
-            answers.append(None)
-            status.append("MULTIPLE")
-
-        else:
+        elif len(filled) == 1:
             answers.append(filled[0])
             status.append("OK")
+        else:
+            # Check for poor erasures by comparing densities
+            sorted_indices = np.argsort(vals)[::-1]
+            top_val = vals[sorted_indices[0]]
+            second_val = vals[sorted_indices[1]]
 
-    return answers,status
+            # If the second highest is >60% as dense as the highest, it's a true double mark
+            if second_val > (top_val * 0.60):
+                answers.append(None)
+                status.append("MULTIPLE")
+            else:
+                answers.append(sorted_indices[0])
+                status.append("OK")
+
+    return answers, status
 
 # ================= STREAMLIT ==================
-upload=st.file_uploader("Upload OMR Image", type=['jpg','jpeg','png'])
+upload = st.file_uploader("Upload OMR Image", type=['jpg','jpeg','png'])
 
 if upload:
+    img = Image.open(upload).convert('RGB')
+    img_np = np.array(img)
+    img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    img=Image.open(upload).convert('RGB')
-    img_np=np.array(img)
-    img_cv=cv2.cvtColor(img_np,cv2.COLOR_RGB2BGR)
+    warped = detect_anchors_and_warp(img_cv)
 
-    warped=detect_anchors_and_warp(img_cv)
+    region = get_answer_region(warped)
+    thr = preprocess(region)
 
-    region=get_answer_region(warped)
-    thr=preprocess(region)
+    cols = split_columns(thr)
 
-    cols=split_columns(thr)
-
-    all_ans=[]
-    all_stat=[]
+    all_ans = []
+    all_stat = []
 
     for c in cols:
-        a,s=detect_bubbles(c)
+        a, s = detect_bubbles(c)
         all_ans.extend(a)
         all_stat.extend(s)
 
-    correct=0
-    incorrect=0
-    unattempted=0
+    correct = 0
+    incorrect = 0
+    unattempted = 0
 
     for i in range(60):
-
-        if all_stat[i]=="UNATTEMPTED":
-            unattempted+=1
-
-        elif all_stat[i]=="MULTIPLE":
-            incorrect+=1
-
+        if all_stat[i] == "UNATTEMPTED":
+            unattempted += 1
+        elif all_stat[i] == "MULTIPLE":
+            incorrect += 1
         else:
-            if OPTIONS[all_ans[i]]==ANSWER_KEY[i]:
-                correct+=1
+            if OPTIONS[all_ans[i]] == ANSWER_KEY[i]:
+                correct += 1
             else:
-                incorrect+=1
+                incorrect += 1
 
-    pos=correct*POS_MARK
-    neg=incorrect*abs(NEG_MARK)
-    total=pos-neg
+    pos = correct * POS_MARK
+    neg = incorrect * abs(NEG_MARK)
+    total = pos - neg
 
     st.subheader("RESULT")
-    c1,c2,c3=st.columns(3)
-    c1.metric("Correct",correct)
-    c2.metric("Incorrect",incorrect)
-    c3.metric("Unattempted",unattempted)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Correct", correct)
+    c2.metric("Incorrect", incorrect)
+    c3.metric("Unattempted", unattempted)
 
-    c4,c5,c6=st.columns(3)
-    c4.metric("Positive Score",pos)
-    c5.metric("Negative Score",neg)
-    c6.metric("Total Score",total)
+    c4, c5, c6 = st.columns(3)
+    c4.metric("Positive Score", pos)
+    c5.metric("Negative Score", neg)
+    c6.metric("Total Score", total)
 
-    st.image(cv2.cvtColor(warped,cv2.COLOR_BGR2RGB),
-             caption="Aligned OMR", use_column_width=True)
+    st.image(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB),
+             caption="Aligned OMR", use_container_width=True)
