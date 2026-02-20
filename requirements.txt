@@ -5,3 +5,4 @@ Pillow
 imutils
 pyzbar
 scipy
+PyMuPDF
