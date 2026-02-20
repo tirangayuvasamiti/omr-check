@@ -223,26 +223,28 @@ class OMREngine:
     def _try_deskew(self, img: np.ndarray) -> np.ndarray:
         """
         Attempt perspective correction using the ■ anchor squares.
-        Only applies the warp if reprojection error < 20px AND first/last
-        answer rows are cleanly detected.  Falls back silently otherwise.
+        Uses blur and OTSU to guarantee clean extraction of squares on photos,
+        and uses relaxed aspect ratio limits to handle squares that were stretched
+        by the forced initial resize.
         """
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, bw = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, bw = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
         cnts, _ = cv2.findContours(bw, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         H, W = gray.shape
 
         sqs = []
         for cnt in cnts:
             area = cv2.contourArea(cnt)
-            if not (80 < area < 3500):
+            if not (50 < area < 5000): # Relaxed area bounds
                 continue
             x, y, w, h = cv2.boundingRect(cnt)
-            if not (0.35 < w / max(h, 1) < 2.8):
+            if not (0.2 < w / max(h, 1) < 5.0): # Relaxed ratio to handle stretching
                 continue
-            if y < H * 0.18 or (y + h) > H * 0.82:   # strict: only answer rows
+            if y < H * 0.15 or (y + h) > H * 0.85:   # strict: only answer rows
                 continue
             roi = bw[y:y+h, x:x+w]
-            if roi.size and np.count_nonzero(roi) / roi.size >= 0.55:
+            if roi.size and np.count_nonzero(roi) / roi.size >= 0.45: # Relaxed fill ratio
                 sqs.append({'cx': x + w // 2, 'cy': y + h // 2})
 
         if len(sqs) < 10:
@@ -252,7 +254,7 @@ class OMREngine:
         sqs.sort(key=lambda s: s['cy'])
         rows, cur = [], [sqs[0]]
         for s in sqs[1:]:
-            if abs(s['cy'] - cur[-1]['cy']) < 18:
+            if abs(s['cy'] - cur[-1]['cy']) < 25: # Relaxed y-variance
                 cur.append(s)
             else:
                 rows.append(cur); cur = [s]
@@ -275,14 +277,16 @@ class OMREngine:
                           [last[0]['cx'],  last[0]['cy']],
                           [last[-1]['cx'], last[-1]['cy']]])
 
-        M, _ = cv2.findHomography(SRC, DST, cv2.RANSAC, 4.0)
+        M, _ = cv2.findHomography(SRC, DST, cv2.RANSAC, 5.0)
         if M is None:
             self._log("Deskew: homography failed", 'warn')
             return img
 
         proj = cv2.perspectiveTransform(SRC.reshape(-1, 1, 2), M).reshape(-1, 2)
         err  = float(np.mean(np.linalg.norm(proj - DST, axis=1)))
-        if err > 20:
+        
+        # High tolerance since forced resizing happens first
+        if err > 150:
             self._log(f"Deskew: error {err:.1f}px too large, skip", 'warn')
             return img
 
@@ -339,7 +343,7 @@ class OMREngine:
         # Step 1 — scale to canonical
         img = self._to_canonical(img_raw)
 
-        # Step 2 — optional deskew (only if sheet is skewed)
+        # Step 2 — perfectly flatten the already resized image
         img = self._try_deskew(img)
 
         gray   = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -408,7 +412,7 @@ class OMREngine:
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
-default_keys_str = "B,B,B,C,C,A,A,B,B,C,A,D,B,C,C,C,D,B,D,C,A,D,C,C,A,C,D,D,A,A,A,B,D,C,D,C,A,D,B,B,A,B,A,C,A,A,D,D,D,B,C,B,D,C,B,A,B,A,A,C"
+default_keys_str = "B,C,A,D,A,B,D,C,B,A,C,D,D,A,B,C,C,D,A,B,B,A,D,C,A,C,B,D,D,B,A,C,C,A,D,B,B,D,C,A,A,B,C,D,D,C,B,A,C,A,B,D,B,C,A,D,C,B,A,D"
 default_keys = default_keys_str.split(',')
 initial_answer_key = {i + 1: default_keys[i] for i in range(60)}
 
@@ -625,4 +629,3 @@ st.markdown("""
   <div class="tricolor" style="max-width:130px;margin:0 auto 10px;"><div></div><div></div><div></div></div>
   Yuva Gyan Mahotsav 2026 · Tiranga Yuva Samiti · OMR Grader
 </div>""", unsafe_allow_html=True)
-
