@@ -1,29 +1,25 @@
-# Streamlit OMR Auto-Grader for YUVA GYAN MAHOTSAV 2026
-# Single-file app.py — Upload a scanned OMR image to auto-grade
-
 import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
 
-st.set_page_config(page_title="OMR Auto Grader", layout="wide")
+st.set_page_config(layout="wide")
+st.title("YUVA GYAN MAHOTSAV 2026 - OMR AUTO GRADER")
 
-st.title("OMR Auto Grader – YGM 2026")
-
-# ---------------- ANSWER KEY (EDIT IF NEEDED) ----------------
-# 60 questions, options: A,B,C,D
+# ================= ANSWER KEY =================
 ANSWER_KEY = [
-    'A','C','D','A','C','A','C','B','D','D','C','A','D','D','A','D','A','A','C','B',
-    'D','B','D','C','B','A','D','A','B','A','C','B','C','D','A','C','D','B','A','D',
-    'A','C','D','A','B','A','A','C','D','D','D','A','D','A','D','C','B','C','D','C'
+'A','C','D','A','C','A','C','B','D','D','C','A','D','D','A','D','A','A','C','B',
+'D','B','D','C','B','A','D','A','B','A','C','B','C','D','A','C','D','B','A','D',
+'A','C','D','A','B','A','A','C','D','D','D','A','D','A','D','C','B','C','D','C'
 ]
 
 POS_MARK = 3
 NEG_MARK = -1
+OPTIONS = ['A','B','C','D']
 
-# ------------- IMAGE HELPERS -------------
+# ================ PERSPECTIVE =================
 def order_points(pts):
-    rect = np.zeros((4, 2), dtype="float32")
+    rect = np.zeros((4,2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
     rect[2] = pts[np.argmax(s)]
@@ -32,164 +28,189 @@ def order_points(pts):
     rect[3] = pts[np.argmax(diff)]
     return rect
 
-
 def four_point_transform(image, pts):
     rect = order_points(pts)
-    (tl, tr, br, bl) = rect
-    widthA = np.linalg.norm(br - bl)
-    widthB = np.linalg.norm(tr - tl)
-    maxWidth = int(max(widthA, widthB))
-    heightA = np.linalg.norm(tr - br)
-    heightB = np.linalg.norm(tl - bl)
-    maxHeight = int(max(heightA, heightB))
+    (tl,tr,br,bl) = rect
+    widthA = np.linalg.norm(br-bl)
+    widthB = np.linalg.norm(tr-tl)
+    maxWidth = int(max(widthA,widthB))
+    heightA = np.linalg.norm(tr-br)
+    heightB = np.linalg.norm(tl-bl)
+    maxHeight = int(max(heightA,heightB))
     dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-    return warped
+        [0,0],
+        [maxWidth-1,0],
+        [maxWidth-1,maxHeight-1],
+        [0,maxHeight-1]], dtype="float32")
+    M = cv2.getPerspectiveTransform(rect,dst)
+    return cv2.warpPerspective(image,M,(maxWidth,maxHeight))
 
+# ============== ANCHOR DETECTION ==============
+def detect_anchors_and_warp(image):
 
-def detect_paper(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5,5), 0)
-    edged = cv2.Canny(blur, 50, 150)
+    thr = cv2.threshold(gray, 80,255,cv2.THRESH_BINARY_INV)[1]
 
-    cnts, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+    cnts,_ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    anchors = []
 
     for c in cnts:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            return four_point_transform(image, approx.reshape(4,2))
-    return image
+        area = cv2.contourArea(c)
+        if 500 < area < 5000:
+            x,y,w,h = cv2.boundingRect(c)
+            aspect = w/float(h)
+            if 0.8 < aspect < 1.2:
+                anchors.append((x,y,w,h))
 
+    if len(anchors) < 4:
+        return image
 
-def threshold_ultra(warped):
-    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-    thr = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY_INV,15,5)
-    return thr
+    anchors = sorted(anchors, key=lambda b:(b[1],b[0]))
 
-# --------- BUBBLE GRID MAPPING ---------
-# 3 columns × 20 rows × 4 options
+    tl = anchors[0]
+    tr = anchors[1]
+    bl = anchors[-2]
+    br = anchors[-1]
 
+    pts = np.array([
+        [tl[0], tl[1]],
+        [tr[0]+tr[2], tr[1]],
+        [br[0]+br[2], br[1]+br[3]],
+        [bl[0], bl[1]+bl[3]]
+    ], dtype="float32")
+
+    return four_point_transform(image, pts)
+
+# =============== MCQ REGION ===================
 def get_answer_region(warped):
+
     h, w = warped.shape[:2]
-    top = int(h*0.22)
-    bottom = int(h*0.84)
-    left = int(w*0.05)
-    right = int(w*0.95)
+
+    top    = int(h*0.26)
+    bottom = int(h*0.83)
+
+    left   = int(w*0.06)
+    right  = int(w*0.94)
+
     return warped[top:bottom, left:right]
 
+# =============== THRESHOLD ====================
+def preprocess(region):
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray,(5,5),0)
+    thr = cv2.adaptiveThreshold(
+        blur,255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,15,5)
+    return thr
 
+# ============ GRID SPLIT ======================
 def split_columns(region):
-    h, w = region.shape[:2]
+    h,w = region.shape[:2]
     col_w = w//3
-    return [region[:, i*col_w:(i+1)*col_w] for i in range(3)]
+    return [region[:,i*col_w:(i+1)*col_w] for i in range(3)]
 
-
-def detect_bubbles(col_img, thr_col):
-    h, w = col_img.shape[:2]
-    rows = 20
-    opts = 4
+def detect_bubbles(col):
+    h,w = col.shape
+    rows=20
+    opts=4
     row_h = h//rows
     opt_w = w//opts
 
-    responses = []
+    answers=[]
+    status=[]
+
     for r in range(rows):
-        row_vals = []
+
+        vals=[]
+
         for o in range(opts):
-            y1 = r*row_h
-            y2 = (r+1)*row_h
-            x1 = o*opt_w
-            x2 = (o+1)*opt_w
 
-            cell = thr_col[y1:y2, x1:x2]
-            total = cv2.countNonZero(cell)
-            area = cell.shape[0]*cell.shape[1]
-            fill_ratio = total/area
-            row_vals.append(fill_ratio)
-        responses.append(row_vals)
-    return responses
+            y1=r*row_h
+            y2=(r+1)*row_h
+            x1=o*opt_w
+            x2=(o+1)*opt_w
 
+            cell=col[y1:y2,x1:x2]
+            total=cv2.countNonZero(cell)
+            area=cell.shape[0]*cell.shape[1]
+            ratio=total/area
 
-def interpret(row_vals, fill_thr=0.22, multi_margin=0.06):
-    filled = [i for i,v in enumerate(row_vals) if v>fill_thr]
-    if len(filled)==0:
-        return None, "UNATTEMPTED"
-    if len(filled)>1:
-        mx = max(row_vals)
-        top = [i for i,v in enumerate(row_vals) if mx-v<multi_margin]
-        if len(top)>1:
-            return None, "MULTIPLE"
-        return top[0], "OK"
-    return filled[0], "OK"
+            vals.append(ratio)
 
-# ------------- MAIN -------------
-upload = st.file_uploader("Upload OMR Image", type=["jpg","png","jpeg"])
+        filled=[i for i,v in enumerate(vals) if v>0.22]
+
+        if len(filled)==0:
+            answers.append(None)
+            status.append("UNATTEMPTED")
+
+        elif len(filled)>1:
+            answers.append(None)
+            status.append("MULTIPLE")
+
+        else:
+            answers.append(filled[0])
+            status.append("OK")
+
+    return answers,status
+
+# ================= STREAMLIT ==================
+upload=st.file_uploader("Upload OMR Image", type=['jpg','jpeg','png'])
 
 if upload:
-    img = Image.open(upload).convert('RGB')
-    img_np = np.array(img)
-    img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    warped = detect_paper(img_cv)
-    thr = threshold_ultra(warped)
+    img=Image.open(upload).convert('RGB')
+    img_np=np.array(img)
+    img_cv=cv2.cvtColor(img_np,cv2.COLOR_RGB2BGR)
 
-    ans_region = get_answer_region(warped)
-    thr_region = get_answer_region(thr)
+    warped=detect_anchors_and_warp(img_cv)
 
-    cols = split_columns(ans_region)
-    thr_cols = split_columns(thr_region)
+    region=get_answer_region(warped)
+    thr=preprocess(region)
 
-    answers = []
-    status = []
+    cols=split_columns(thr)
 
-    for i in range(3):
-        res = detect_bubbles(cols[i], thr_cols[i])
-        for row in res:
-            idx, stt = interpret(row)
-            answers.append(idx)
-            status.append(stt)
+    all_ans=[]
+    all_stat=[]
 
-    option_map = ['A','B','C','D']
+    for c in cols:
+        a,s=detect_bubbles(c)
+        all_ans.extend(a)
+        all_stat.extend(s)
 
     correct=0
     incorrect=0
     unattempted=0
-    multiple=0
 
-    for i,a in enumerate(answers[:60]):
-        if status[i]=="UNATTEMPTED":
+    for i in range(60):
+
+        if all_stat[i]=="UNATTEMPTED":
             unattempted+=1
-        elif status[i]=="MULTIPLE":
+
+        elif all_stat[i]=="MULTIPLE":
             incorrect+=1
-            multiple+=1
+
         else:
-            if option_map[a]==ANSWER_KEY[i]:
+            if OPTIONS[all_ans[i]]==ANSWER_KEY[i]:
                 correct+=1
             else:
                 incorrect+=1
 
-    pos = correct*POS_MARK
-    neg = incorrect*(-NEG_MARK)
-    total = pos - neg
+    pos=correct*POS_MARK
+    neg=incorrect*abs(NEG_MARK)
+    total=pos-neg
 
-    c1,c2,c3 = st.columns(3)
-    c1.metric("Correct", correct)
-    c2.metric("Incorrect", incorrect)
-    c3.metric("Unattempted", unattempted)
+    st.subheader("RESULT")
+    c1,c2,c3=st.columns(3)
+    c1.metric("Correct",correct)
+    c2.metric("Incorrect",incorrect)
+    c3.metric("Unattempted",unattempted)
 
-    c4,c5,c6 = st.columns(3)
-    c4.metric("Positive Score", pos)
-    c5.metric("Negative Score", neg)
-    c6.metric("Total Score", total)
+    c4,c5,c6=st.columns(3)
+    c4.metric("Positive Score",pos)
+    c5.metric("Negative Score",neg)
+    c6.metric("Total Score",total)
 
-    st.image(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB), caption="Detected OMR", use_column_width=True)
-
-st.markdown("---")
-st.write("Scoring: +3 Correct, -1 Wrong, 0 Unattempted")
+    st.image(cv2.cvtColor(warped,cv2.COLOR_BGR2RGB),
+             caption="Aligned OMR", use_column_width=True)
