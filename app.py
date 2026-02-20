@@ -198,11 +198,15 @@ class OMREngine:
     def load_pdf(self, data: bytes, dpi: int = 150) -> np.ndarray:
         pages = convert_from_bytes(data, dpi=dpi)
         img = cv2.cvtColor(np.array(pages[0]), cv2.COLOR_RGB2BGR)
+        # Force resize to exactly 1240x1754 immediately on load
+        img = cv2.resize(img, (CANONICAL_W, CANONICAL_H))
         self._log(f"PDF → {img.shape[1]}×{img.shape[0]}px", 'ok')
         return img
 
     def load_img(self, pil: Image.Image) -> np.ndarray:
         img = cv2.cvtColor(np.array(pil.convert("RGB")), cv2.COLOR_RGB2BGR)
+        # Force resize to exactly 1240x1754 immediately on load
+        img = cv2.resize(img, (CANONICAL_W, CANONICAL_H))
         self._log(f"Image → {img.shape[1]}×{img.shape[0]}px", 'ok')
         return img
 
@@ -404,7 +408,7 @@ class OMREngine:
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
-default_keys_str = "B,C,A,D,A,B,D,C,B,A,C,D,D,A,B,C,C,D,A,B,B,A,D,C,A,C,B,D,D,B,A,C,C,A,D,B,B,D,C,A,A,B,C,D,D,C,B,A,C,A,B,D,B,C,A,D,C,B,A,D"
+default_keys_str = "B,C,A,D,A,B,D,C,A,C,B,D,A,B,C,D,B,A,D,C,C,D,B,A,D,C,A,B,B,D,C,A,A,C,D,B,C,B,A,D,D,A,C,B,B,C,D,A,C,D,B,A,D,B,A,C,B,D,C,A"
 default_keys = default_keys_str.split(',')
 initial_answer_key = {i + 1: default_keys[i] for i in range(60)}
 
@@ -465,7 +469,12 @@ if uploaded:
         fb = uploaded.read()
         img_cv = (engine.load_pdf(fb, 150) if uploaded.type == 'application/pdf'
                   else engine.load_img(Image.open(io.BytesIO(fb))))
-    st.success(f"✅ **{uploaded.name}** — {img_cv.shape[1]}×{img_cv.shape[0]}px")
+        
+        # Enforce exact dimensions explicitly upon upload
+        if img_cv.shape[1] != CANONICAL_W or img_cv.shape[0] != CANONICAL_H:
+            img_cv = cv2.resize(img_cv, (CANONICAL_W, CANONICAL_H))
+            
+    st.success(f"✅ **{uploaded.name}** — Resized to {CANONICAL_W}×{CANONICAL_H}px")
 
     st.markdown("**⚙️ Settings**")
     st.info(f"**Marking:** +{pos_mark:.1f} correct · −{neg_mark:.1f} wrong/multi")
