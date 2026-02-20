@@ -395,10 +395,6 @@ class OMREngine:
         self._log(f"Done: {correct}✓ {wrong}✗ {unat}— {multi}M  → {ps-ns:.1f}", 'ok')
 
         return (
-            OMREngine(bubbles=results, correct=correct, wrong=wrong,
-                      unattempted=unat, multi=multi,
-                      pos_score=ps, neg_score=ns, total_score=ps - ns,
-                      debug_log=list(self._logs)) if isinstance(self, OMREngine) else 
             OMRResult(bubbles=results, correct=correct, wrong=wrong,
                       unattempted=unat, multi=multi,
                       pos_score=ps, neg_score=ns, total_score=ps - ns,
