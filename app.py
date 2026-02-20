@@ -46,7 +46,7 @@ class YuvaGyanOMRProcessor:
         self.max_bubble_area = 2000
         self.min_circularity = 0.55  # Slightly relaxed for printed circles
         self.fill_threshold = 0.30  # 30% filled to consider marked
-        self.double_mark_ratio = 0.75  # If 2nd is 75%+ of 1st
+        self.double_mark_ratio = 0.70  # Aggressive double mark detection
         
     def load_image(self, uploaded_file) -> np.ndarray:
         """Load image from uploaded file"""
@@ -103,23 +103,21 @@ class YuvaGyanOMRProcessor:
         
         return rect
     
-    def detect_bubbles(self, roi: np.ndarray) -> Tuple[List, np.ndarray]:
+    def detect_bubbles(self, roi: np.ndarray) -> Tuple[List, np.ndarray, np.ndarray]:
         """
-        Detect bubbles using optimized processing:
-        1. CLAHE enhancement
-        2. Otsu thresholding (best results from diagnostic)
-        3. Light morphological cleanup
-        4. Contour detection with shape filtering
+        Detect bubbles using optimized processing.
+        Returns the bubbles list, thresholded image, AND the raw enhanced grayscale 
+        image for advanced intensity analysis.
         """
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
         # CLAHE for better contrast
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
+        enhanced_gray = clahe.apply(gray)
         
         # Otsu's threshold (best method from testing)
         _, thresh = cv2.threshold(
-            enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+            enhanced_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
         )
         
         # Light morphological operations
@@ -172,7 +170,7 @@ class YuvaGyanOMRProcessor:
             })
         
         logger.info(f"Detected {len(bubbles)} bubbles")
-        return bubbles, thresh
+        return bubbles, thresh, enhanced_gray
     
     def organize_bubbles(self, bubbles: List[Dict]) -> List[List[Dict]]:
         """
@@ -216,33 +214,63 @@ class YuvaGyanOMRProcessor:
         
         return all_questions
     
-    def calculate_fill_ratio(self, bubble: Dict, thresh: np.ndarray) -> float:
-        """Calculate how filled a bubble is"""
+    def analyze_bubble_intensity(self, bubble: Dict, thresh: np.ndarray, gray: np.ndarray) -> Dict:
+        """AI-inspired CV approach: Combines pixel ratio with localized pixel intensity distributions"""
         mask = np.zeros(thresh.shape, dtype=np.uint8)
         cv2.drawContours(mask, [bubble['contour']], -1, 255, -1)
         
+        # 1. Standard pixel area fill ratio (binary)
         filled = cv2.countNonZero(cv2.bitwise_and(thresh, mask))
         total = cv2.countNonZero(mask)
+        fill_ratio = filled / total if total > 0 else 0.0
         
-        return filled / total if total > 0 else 0.0
+        # 2. Photometric darkness intensity (robust against varied lighting/pen ink/smudges)
+        mean_val = cv2.mean(gray, mask=mask)[0]
+        # Invert so higher = darker (0 = white, 255 = solid black ink)
+        darkness = 255.0 - mean_val
+        
+        return {
+            'fill_ratio': fill_ratio,
+            'darkness': darkness
+        }
     
-    def grade_question(self, q_num: int, bubbles: List[Dict], thresh: np.ndarray) -> Dict:
-        """Grade a single question"""
-        # Calculate fill for each option
-        fills = [(self.calculate_fill_ratio(b, thresh), i, b) for i, b in enumerate(bubbles)]
-        fills.sort(reverse=True, key=lambda x: x[0])
-        
-        # Determine marked options
-        marked = []
-        if fills[0][0] >= self.fill_threshold:
-            marked.append(fills[0][1])
+    def grade_question(self, q_num: int, bubbles: List[Dict], thresh: np.ndarray, gray: np.ndarray) -> Dict:
+        """Advanced grading using statistical gap analysis to confidently detect filled and multi-filled bubbles"""
+        stats = []
+        for i, b in enumerate(bubbles):
+            metrics = self.analyze_bubble_intensity(b, thresh, gray)
+            stats.append((metrics['darkness'], metrics['fill_ratio'], i, b))
             
-            # Check for double mark
-            if (len(fills) > 1 and 
-                fills[1][0] >= self.fill_threshold and
-                fills[1][0] >= fills[0][0] * self.double_mark_ratio):
-                marked.append(fills[1][1])
+        # Sort heavily by darkness metric (most reliable for pen marks) and then fill ratio
+        stats.sort(reverse=True, key=lambda x: (x[0], x[1]))
         
+        marked = []
+        
+        # Top candidate metrics
+        top_darkness = stats[0][0]
+        top_fill = stats[0][1]
+        
+        # Dynamic baseline check: is it actually filled?
+        # Absolute baseline (darkness > 80) handles light pen strokes that fail the binary 30% fill threshold
+        if top_fill >= self.fill_threshold or top_darkness >= 80.0: 
+            marked.append(stats[0][2])
+            
+            # Double mark detection: Check if 2nd candidate is suspiciously close to the 1st
+            if len(stats) > 1:
+                second_darkness = stats[1][0]
+                second_fill = stats[1][1]
+                
+                # If 2nd choice meets strict fill ratio OR is proportionately as dark as the 1st
+                if (second_fill >= self.fill_threshold) or (second_darkness >= top_darkness * self.double_mark_ratio):
+                    marked.append(stats[1][2])
+                    
+                # Catch messy triple marks
+                if len(stats) > 2:
+                    third_darkness = stats[2][0]
+                    third_fill = stats[2][1]
+                    if (third_fill >= self.fill_threshold) or (third_darkness >= top_darkness * self.double_mark_ratio):
+                        marked.append(stats[2][2])
+
         # Grade
         correct_ans = ANS_KEY.get(q_num, 1) - 1
         
@@ -270,7 +298,7 @@ class YuvaGyanOMRProcessor:
         }
     
     def annotate_sheet(self, roi: np.ndarray, questions: List[List[Dict]], 
-                      results: List[Dict]) -> np.ndarray:
+                       results: List[Dict]) -> np.ndarray:
         """Draw grading annotations on the sheet"""
         annotated = roi.copy()
         
@@ -306,8 +334,8 @@ class YuvaGyanOMRProcessor:
             # Step 1: Preprocess
             _, roi = self.preprocess_sheet(image)
             
-            # Step 2: Detect bubbles
-            bubbles, thresh = self.detect_bubbles(roi)
+            # Step 2: Detect bubbles (Now grabs grayscale mapping for AI intensity analytics)
+            bubbles, thresh, gray = self.detect_bubbles(roi)
             
             if len(bubbles) < 200:
                 return None, roi, [], f"Error: Only {len(bubbles)} bubbles detected (need ~240)"
@@ -324,7 +352,7 @@ class YuvaGyanOMRProcessor:
             
             for q_num in range(1, 61):
                 if q_num - 1 < len(questions):
-                    result = self.grade_question(q_num, questions[q_num - 1], thresh)
+                    result = self.grade_question(q_num, questions[q_num - 1], thresh, gray)
                     results.append(result)
                     
                     if result['is_correct']:
