@@ -102,7 +102,7 @@ html,body,[class*="css"]{font-family:'Space Grotesk',sans-serif;background:var(-
 .bs-c{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);color:#22C55E;}
 .bs-w{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#EF4444;}
 .bs-s{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);color:#F59E0B;}
-.bs-m{background:rgba(168,85,247,.1);border:1px solid rgba(168,85,247,.3);color:#A855F7;}
+.bs-m{background:rgba(168,85,247,.1);border:1px solid rgba(168,85,247,.3);color:#A855F7;}.bs-b{background:rgba(96,165,250,.1);border:1px solid rgba(96,165,250,.3);color:#60A5FA;}
 .legend{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 14px;}
 .chip{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:.72rem;font-weight:600;border:1px solid;}
 .ch-g{background:rgba(34,197,94,.08);border-color:rgba(34,197,94,.3);color:#22C55E;}
@@ -356,12 +356,13 @@ class OMREngine:
                     status, score = 'unattempted', 0.0
                 elif len(selected) > 1:
                     status, score = 'multi', (-neg if key else 0.0)
-                elif key and selected[0] == key:
+                elif not key:
+                    # Bubble detected but no answer key set — mark as answered (neutral)
+                    status, score = 'answered', 0.0
+                elif selected[0] == key:
                     status, score = 'correct', float(pos)
-                elif key:
-                    status, score = 'wrong', float(-neg)
                 else:
-                    status, score = 'unattempted', 0.0
+                    status, score = 'wrong', float(-neg)
 
                 results.append(BubbleResult(
                     q_num=q_num, detected=selected, answer_key=key,
@@ -369,8 +370,10 @@ class OMREngine:
                 ))
 
                 # ── Draw ──────────────────────────────────────────────────
-                clr = {'correct':C_CORRECT,'wrong':C_WRONG,
-                       'multi':C_MULTI,'unattempted':C_UNATTEMPT}[status]
+                C_ANSWERED = (50, 170, 240)
+                clr = {'correct': C_CORRECT, 'wrong': C_WRONG,
+                       'multi': C_MULTI, 'unattempted': C_UNATTEMPT,
+                       'answered': C_ANSWERED}[status]
 
                 for opt in 'ABCD':
                     cx = BUBBLE_CX[col_idx][opt]
@@ -384,7 +387,7 @@ class OMREngine:
 
                     # Green ring: show where correct answer was, if student was wrong
                     if (key == opt and opt not in selected
-                            and status not in ('correct', 'unattempted')):
+                            and status not in ('correct', 'unattempted', 'answered')):
                         cv2.circle(canvas, (cx, cy), DRAW_R + 4, C_CORR_IND, 2)
 
         correct = sum(1 for r in results if r.status == 'correct')
@@ -472,6 +475,7 @@ st.markdown("""
   <span class="chip ch-r">● Wrong</span>
   <span class="chip ch-n">○ Unattempted</span>
   <span class="chip ch-p">● Multi-Mark</span>
+  <span class="chip ch-b" style="background:rgba(96,165,250,.08);border-color:rgba(96,165,250,.3);color:#60A5FA;">● Answered (no key)</span>
   <span class="chip ch-g">◎ Missed correct</span>
 </div>""", unsafe_allow_html=True)
 
@@ -499,6 +503,9 @@ if uploaded:
 **Grid:** Pixel-verified YGM 2026 coordinates  
 **Detection:** Relative darkness (empty≈0.33 / filled≈1.00)  
 **Annotation:** Drawn directly on scaled canonical image  
+
+⚠️ **Set Answer Key in sidebar to grade (Correct / Wrong).**  
+Without a key, filled bubbles show as Answered (cyan).
         """)
         if st.button("🚀  Grade Now", use_container_width=True):
             bar = st.progress(0, text="Scaling to canonical frame…")
@@ -592,8 +599,8 @@ if st.session_state.result is not None:
     st.markdown('<div class="sh"><div class="sdot"></div><h3>Question-wise Report</h3></div>',
                 unsafe_allow_html=True)
     filt = st.multiselect("Filter by status",
-                          ['correct','wrong','unattempted','multi'],
-                          default=['correct','wrong','unattempted','multi'])
+                          ['correct','wrong','unattempted','multi','answered'],
+                          default=['correct','wrong','unattempted','multi','answered'])
     filtered = [b for b in result.bubbles if b.status in filt]
 
     rows_html = ""
@@ -602,8 +609,8 @@ if st.session_state.result is not None:
         key  = b.answer_key or '—'
         sc   = f"+{b.score:.0f}" if b.score>0 else (f"{b.score:.0f}" if b.score<0 else "0")
         sclr = "cg" if b.score>0 else ("cr" if b.score<0 else "ca")
-        bcls = {'correct':'bs-c','wrong':'bs-w','unattempted':'bs-s','multi':'bs-m'}.get(b.status,'')
-        bico = {'correct':'✓','wrong':'✗','unattempted':'—','multi':'×'}.get(b.status,'')
+        bcls = {'correct':'bs-c','wrong':'bs-w','unattempted':'bs-s','multi':'bs-m','answered':'bs-b'}.get(b.status,'')
+        bico = {'correct':'✓','wrong':'✗','unattempted':'—','multi':'×','answered':'●'}.get(b.status,'')
         fv_td = (f"<td style='font-size:.69rem;color:var(--mu);font-family:JetBrains Mono,monospace;"
                  f"white-space:nowrap;'>{'  '.join(f'{k}:{v:.2f}' for k,v in sorted(b.fill_values.items()))}</td>"
                  if show_fills else "")
