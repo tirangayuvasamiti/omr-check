@@ -1,192 +1,346 @@
-"""
-YUVA GYAN MAHOTSAV 2026 — Ultra Precise OMR Grader v4.0
-========================================================
-Built from EXACT analysis of the official OMR sheet:
-
-SHEET STRUCTURE per row:
-  ■  A○  B○  C○  D○  ■
-  └── Left anchor square (solid filled ■)
-       └── 4 circles: A, B, C, D
-                               └── Right anchor square (solid filled ■)
-
-LAYOUT:
-  • 3 columns × 20 questions = 60 total
-  • Each row has: left-■ | A○ | B○ | C○ | D○ | right-■
-  • The solid black squares are MACHINE-PRINTED timing marks — perfect anchors
-  • Bubbles are open circles (○) that candidates fill
-
-DETECTION STRATEGY:
-  1. Find ALL solid black squares (high fill, roughly square shape)
-  2. Group squares into LEFT anchors and RIGHT anchors per column
-  3. For each left anchor row → compute exact A/B/C/D circle positions
-     using the distance from left-■ to right-■ to interpolate A/B/C/D
-  4. Measure fill inside each circle using adaptive + intensity methods
-  5. Classify with relative dominance logic
-"""
-
 import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
 import fitz  # PyMuPDF
 import io
+import json
 import pandas as pd
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
+from typing import Optional, List, Dict, Tuple
+import tempfile
+import os
 import time
 import random
+from scipy import ndimage
+from sklearn.cluster import DBSCAN
 
-# ─── Page Config ──────────────────────────────────────────────────────────────
+# ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Yuva Gyan Mahotsav 2026 – OMR Grader",
+    page_title="Yuva Gyan Mahotsav 2026 – Ultra OMR Grader",
     page_icon="🎓",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ─── CSS ─────────────────────────────────────────────────────────────────────
+# ─── Custom CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Syne:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
 
 :root {
-    --saffron: #F97316; --saffron-d: #EA580C;
-    --navy: #0F172A; --navy-m: #1E293B; --navy-l: #334155;
-    --green: #22C55E; --green-d: #16A34A;
-    --gold: #F59E0B; --white: #F8FAFC;
-    --bg: #080D1A; --surface: #0F1923; --surface2: #162032; --surface3: #1D2D45;
-    --border: rgba(255,255,255,0.07); --border-s: rgba(249,115,22,0.35);
-    --text: #E2E8F0; --muted: #64748B;
-    --correct: #22C55E; --wrong: #EF4444; --skip: #F59E0B; --multi: #A855F7;
+    --saffron: #F97316;
+    --saffron-d: #EA580C;
+    --navy: #0F172A;
+    --navy-m: #1E293B;
+    --navy-l: #334155;
+    --green: #22C55E;
+    --green-d: #16A34A;
+    --gold: #F59E0B;
+    --white: #F8FAFC;
+    --bg: #0A0F1E;
+    --surface: #111827;
+    --surface2: #1A2235;
+    --surface3: #243047;
+    --border: rgba(255,255,255,0.08);
+    --border-h: rgba(249,115,22,0.4);
+    --text: #F1F5F9;
+    --muted: #94A3B8;
+    --correct: #22C55E;
+    --wrong: #EF4444;
+    --skip: #F59E0B;
+    --multi: #A855F7;
+    --glow-s: 0 0 20px rgba(249,115,22,0.3);
+    --glow-g: 0 0 20px rgba(34,197,94,0.3);
+    --glow-r: 0 0 20px rgba(239,68,68,0.3);
 }
 
-*, *::before, *::after { box-sizing: border-box; }
-html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; background: var(--bg); color: var(--text); }
-.stApp { background: var(--bg) !important; }
-.main .block-container { padding-top: 1.2rem; padding-bottom: 3rem; max-width: 1440px; }
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, [class*="css"] {
+    font-family: 'Space Grotesk', sans-serif;
+    background-color: var(--bg);
+    color: var(--text);
+}
+
+.stApp { background-color: var(--bg) !important; }
+.main .block-container { padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1400px; }
 
 /* HEADER */
 .omr-header {
-    background: linear-gradient(135deg, #0A1628 0%, #0F1F3D 50%, #0A1628 100%);
-    border: 1px solid rgba(249,115,22,0.2);
-    border-radius: 18px; padding: 28px 36px 24px; margin-bottom: 24px; position: relative; overflow: hidden;
+    background: linear-gradient(135deg, #0F172A 0%, #1E293B 50%, #0F172A 100%);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 32px 40px 28px;
+    margin-bottom: 28px;
+    position: relative;
+    overflow: hidden;
 }
 .omr-header::before {
-    content:''; position:absolute; top:-80px; right:-80px; width:260px; height:260px;
-    background: radial-gradient(circle, rgba(249,115,22,0.12) 0%, transparent 65%); border-radius:50%;
+    content: '';
+    position: absolute;
+    top: -60px; right: -60px;
+    width: 220px; height: 220px;
+    background: radial-gradient(circle, rgba(249,115,22,0.15) 0%, transparent 70%);
+    border-radius: 50%;
 }
 .omr-header::after {
-    content:''; position:absolute; bottom:-50px; left:8%; width:180px; height:180px;
-    background: radial-gradient(circle, rgba(34,197,94,0.08) 0%, transparent 65%); border-radius:50%;
+    content: '';
+    position: absolute;
+    bottom: -40px; left: 10%;
+    width: 150px; height: 150px;
+    background: radial-gradient(circle, rgba(34,197,94,0.1) 0%, transparent 70%);
+    border-radius: 50%;
 }
-.tricolor { display:flex; height:4px; border-radius:2px; overflow:hidden; margin-bottom:16px; max-width:360px; }
-.tricolor div:nth-child(1){flex:1;background:linear-gradient(90deg,#F97316,#EA580C);}
-.tricolor div:nth-child(2){flex:1;background:#E2E8F0;}
-.tricolor div:nth-child(3){flex:1;background:linear-gradient(90deg,#22C55E,#16A34A);}
+.tricolor-bar {
+    display: flex;
+    height: 4px;
+    border-radius: 2px;
+    overflow: hidden;
+    margin-bottom: 20px;
+    width: 100%;
+    max-width: 400px;
+}
+.tricolor-bar div:nth-child(1) { flex:1; background:linear-gradient(90deg, #F97316, #EA580C); }
+.tricolor-bar div:nth-child(2) { flex:1; background:#F8FAFC; }
+.tricolor-bar div:nth-child(3) { flex:1; background:linear-gradient(90deg, #22C55E, #16A34A); }
 .omr-title {
-    font-family:'Syne',sans-serif; font-size:2.5rem; font-weight:800;
-    background: linear-gradient(130deg, #F1F5F9 20%, #F97316 60%, #22C55E 100%);
-    -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;
-    line-height:1.1; position:relative; z-index:1;
+    font-family: 'Syne', sans-serif;
+    font-size: 2.6rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #F8FAFC 30%, #F97316 70%, #22C55E 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    line-height: 1.1;
+    position: relative;
+    z-index: 1;
 }
-.omr-sub { font-size:0.87rem; color:var(--muted); margin-top:7px; z-index:1; position:relative; }
-.tech-pill {
-    display:inline-flex; align-items:center; gap:5px;
-    padding:3px 10px; border-radius:20px; font-size:0.73rem; font-weight:700;
-    background:rgba(34,197,94,0.1); border:1px solid rgba(34,197,94,0.25); color:#22C55E;
-    font-family:'JetBrains Mono',monospace; margin-top:8px;
+.omr-subtitle {
+    font-size: 0.88rem;
+    color: var(--muted);
+    margin-top: 8px;
+    font-weight: 400;
+    letter-spacing: 0.3px;
+    position: relative;
+    z-index: 1;
 }
+.badge-mark {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    font-family: 'JetBrains Mono', monospace;
+}
+.badge-mark.pos { background: rgba(34,197,94,0.15); border: 1px solid rgba(34,197,94,0.3); color: #22C55E; }
+.badge-mark.neg { background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.3); color: #EF4444; }
 
-/* STAT GRID */
-.stat-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:10px; margin:18px 0; }
+/* STAT CARDS */
+.stat-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin: 20px 0; }
 .stat-card {
-    background:var(--surface); border:1px solid var(--border);
-    border-radius:14px; padding:18px 14px; text-align:center;
-    position:relative; overflow:hidden; transition:transform .2s;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px 16px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.2s, transform 0.2s;
 }
-.stat-card:hover { transform:translateY(-2px); }
-.stat-card.c { border-color:rgba(34,197,94,.3); }
-.stat-card.w { border-color:rgba(239,68,68,.3); }
-.stat-card.s { border-color:rgba(245,158,11,.3); }
-.stat-card.m { border-color:rgba(168,85,247,.3); }
-.stat-card.sc { border-color:rgba(249,115,22,.4); background:linear-gradient(135deg,rgba(249,115,22,.06),var(--surface)); }
-.glow { position:absolute; bottom:0; left:0; right:0; height:2px; }
-.stat-card.c .glow{background:#22C55E;box-shadow:0 0 8px #22C55E;}
-.stat-card.w .glow{background:#EF4444;box-shadow:0 0 8px #EF4444;}
-.stat-card.s .glow{background:#F59E0B;box-shadow:0 0 8px #F59E0B;}
-.stat-card.m .glow{background:#A855F7;box-shadow:0 0 8px #A855F7;}
-.stat-card.sc .glow{background:#F97316;box-shadow:0 0 12px #F97316;}
-.sn { font-family:'Syne',sans-serif; font-size:2.8rem; font-weight:800; line-height:1; letter-spacing:-1px; }
-.sl { font-size:0.68rem; color:var(--muted); text-transform:uppercase; letter-spacing:2px; margin-top:5px; font-weight:600; }
-.cg{color:#22C55E;} .cr{color:#EF4444;} .ca{color:#F59E0B;} .co{color:#F97316;} .cp{color:#A855F7;}
+.stat-card:hover { transform: translateY(-2px); }
+.stat-card.correct { border-color: rgba(34,197,94,0.3); }
+.stat-card.wrong   { border-color: rgba(239,68,68,0.3); }
+.stat-card.skip    { border-color: rgba(245,158,11,0.3); }
+.stat-card.multi   { border-color: rgba(168,85,247,0.3); }
+.stat-card.score   { border-color: rgba(249,115,22,0.4); background: linear-gradient(135deg, rgba(249,115,22,0.08), var(--surface)); }
+.stat-glow {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 2px;
+}
+.stat-card.correct .stat-glow { background: #22C55E; box-shadow: 0 0 8px #22C55E; }
+.stat-card.wrong   .stat-glow { background: #EF4444; box-shadow: 0 0 8px #EF4444; }
+.stat-card.skip    .stat-glow { background: #F59E0B; box-shadow: 0 0 8px #F59E0B; }
+.stat-card.multi   .stat-glow { background: #A855F7; box-shadow: 0 0 8px #A855F7; }
+.stat-card.score   .stat-glow { background: #F97316; box-shadow: 0 0 12px #F97316; }
+.stat-num {
+    font-family: 'Syne', sans-serif;
+    font-size: 3rem;
+    font-weight: 800;
+    line-height: 1;
+    letter-spacing: -1px;
+}
+.stat-label {
+    font-size: 0.7rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    margin-top: 6px;
+    font-weight: 600;
+}
+.c-green  { color: #22C55E; }
+.c-red    { color: #EF4444; }
+.c-amber  { color: #F59E0B; }
+.c-orange { color: #F97316; }
+.c-purple { color: #A855F7; }
 
 /* RESULT BANNER */
-.rbanner {
-    border-radius:14px; padding:18px 22px; margin:14px 0;
-    display:flex; align-items:center; gap:14px;
-    font-family:'Syne',sans-serif; font-size:1.15rem; font-weight:700;
+.result-banner {
+    border-radius: 14px;
+    padding: 18px 24px;
+    margin: 16px 0;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-family: 'Syne', sans-serif;
+    font-size: 1.2rem;
+    font-weight: 700;
+    position: relative;
+    overflow: hidden;
 }
-.rb-ex{background:rgba(34,197,94,.07);border:1px solid rgba(34,197,94,.3);color:#22C55E;}
-.rb-gd{background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.3);color:#F59E0B;}
-.rb-av{background:rgba(249,115,22,.07);border:1px solid rgba(249,115,22,.3);color:#F97316;}
-.rb-pr{background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.3);color:#EF4444;}
+.banner-excellent { background: rgba(34,197,94,0.08); border: 1px solid rgba(34,197,94,0.3); color: #22C55E; }
+.banner-good      { background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.3); color: #F59E0B; }
+.banner-average   { background: rgba(249,115,22,0.08); border: 1px solid rgba(249,115,22,0.3); color: #F97316; }
+.banner-poor      { background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.3); color: #EF4444; }
 
-/* SCORE PROGRESS */
-.score-track{height:7px;background:var(--surface3);border-radius:4px;overflow:hidden;margin-top:6px;}
-.score-fill{height:100%;border-radius:4px;}
+/* PROGRESS BAR */
+.score-progress { margin: 12px 0; }
+.score-track {
+    height: 8px;
+    background: var(--surface3);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-top: 6px;
+}
+.score-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.8s ease;
+}
 
-/* BUBBLE TABLE */
-.btable{width:100%;border-collapse:collapse;font-size:0.84rem;background:var(--surface);}
-.btable th{background:var(--surface2);color:var(--muted);text-transform:uppercase;font-size:0.69rem;
-           font-weight:700;letter-spacing:1.5px;padding:13px 12px;border-bottom:1px solid var(--border);}
-.btable td{padding:10px 12px;border-bottom:1px solid var(--border);color:var(--text);}
-.btable tr:hover td{background:rgba(249,115,22,.04);}
-.btable td:first-child{font-family:'JetBrains Mono',monospace;font-weight:600;color:var(--muted);}
-.bs{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;
-    font-size:0.71rem;font-weight:700;letter-spacing:.5px;text-transform:uppercase;}
-.bs-c{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);color:#22C55E;}
-.bs-w{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#EF4444;}
-.bs-s{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);color:#F59E0B;}
-.bs-m{background:rgba(168,85,247,.1);border:1px solid rgba(168,85,247,.3);color:#A855F7;}
+/* TABLE */
+.bubble-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; background: var(--surface); }
+.bubble-table th {
+    background: var(--surface2);
+    color: var(--muted);
+    text-transform: uppercase;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+    padding: 14px 12px;
+    border-bottom: 1px solid var(--border);
+}
+.bubble-table td { padding: 11px 12px; border-bottom: 1px solid var(--border); color: var(--text); }
+.bubble-table tr:hover td { background: rgba(249,115,22,0.04); }
+.bubble-table td:first-child { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--muted); }
+.badge-status {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 10px; border-radius: 20px;
+    font-size: 0.72rem; font-weight: 700;
+    letter-spacing: 0.5px; text-transform: uppercase;
+}
+.bs-correct { background: rgba(34,197,94,0.12);  border: 1px solid rgba(34,197,94,0.3); color: #22C55E; }
+.bs-wrong   { background: rgba(239,68,68,0.12);  border: 1px solid rgba(239,68,68,0.3); color: #EF4444; }
+.bs-skip    { background: rgba(245,158,11,0.12); border: 1px solid rgba(245,158,11,0.3); color: #F59E0B; }
+.bs-multi   { background: rgba(168,85,247,0.12); border: 1px solid rgba(168,85,247,0.3); color: #A855F7; }
 
-/* LEGEND CHIPS */
-.legend{display:flex;gap:9px;flex-wrap:wrap;margin:10px 0 16px;}
-.chip{display:inline-flex;align-items:center;gap:5px;padding:4px 11px;border-radius:20px;font-size:0.73rem;font-weight:600;border:1px solid;}
-.cg-c{background:rgba(34,197,94,.08);border-color:rgba(34,197,94,.3);color:#22C55E;}
-.cg-r{background:rgba(239,68,68,.08);border-color:rgba(239,68,68,.3);color:#EF4444;}
-.cg-a{background:rgba(245,158,11,.08);border-color:rgba(245,158,11,.3);color:#F59E0B;}
-.cg-p{background:rgba(168,85,247,.08);border-color:rgba(168,85,247,.3);color:#A855F7;}
-.cg-g{background:rgba(100,116,139,.08);border-color:rgba(100,116,139,.3);color:#64748B;}
+/* UPLOAD ZONE */
+.upload-info {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+}
+.upload-info p { color: var(--muted); font-size: 0.88rem; line-height: 1.6; }
 
-/* DEBUG */
-.dlog{background:var(--surface2);border:1px solid var(--border);border-radius:9px;
-      padding:14px;font-family:'JetBrains Mono',monospace;font-size:0.74rem;
-      color:var(--muted);margin-top:10px;max-height:220px;overflow-y:auto;}
-.dlog .ok{color:#22C55E;} .dlog .warn{color:#F59E0B;} .dlog .info{color:#60A5FA;}
+/* SECTION HEADERS */
+.section-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 24px 0 14px;
+}
+.section-header h3 {
+    font-family: 'Syne', sans-serif;
+    font-size: 1.2rem;
+    font-weight: 700;
+    color: var(--text);
+}
+.section-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--saffron);
+    box-shadow: 0 0 8px var(--saffron);
+}
 
-/* SECTION HEADER */
-.sh{display:flex;align-items:center;gap:9px;margin:22px 0 12px;}
-.sh h3{font-family:'Syne',sans-serif;font-size:1.15rem;font-weight:700;}
-.sdot{width:7px;height:7px;border-radius:50%;background:var(--saffron);box-shadow:0 0 8px var(--saffron);}
+/* LEGEND */
+.legend { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0 18px; }
+.chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 4px 11px; border-radius: 20px;
+    font-size: 0.74rem; font-weight: 600;
+    border: 1px solid;
+}
+.chip-green  { background: rgba(34,197,94,0.08);  border-color: rgba(34,197,94,0.3); color: #22C55E; }
+.chip-red    { background: rgba(239,68,68,0.08);  border-color: rgba(239,68,68,0.3); color: #EF4444; }
+.chip-amber  { background: rgba(245,158,11,0.08); border-color: rgba(245,158,11,0.3); color: #F59E0B; }
+.chip-purple { background: rgba(168,85,247,0.08); border-color: rgba(168,85,247,0.3); color: #A855F7; }
+.chip-gray   { background: rgba(148,163,184,0.08); border-color: rgba(148,163,184,0.3); color: #94A3B8; }
 
-/* SIDEBAR */
-section[data-testid="stSidebar"]{background:var(--surface)!important;border-right:1px solid var(--border)!important;}
-section[data-testid="stSidebar"] *{color:var(--text)!important;}
-section[data-testid="stSidebar"] label{font-weight:600!important;font-size:0.83rem!important;}
-.stSelectbox>div>div,.stTextInput>div>input,.stNumberInput>div>input{
-    background:var(--surface2)!important;border-color:var(--border)!important;color:var(--text)!important;border-radius:8px!important;}
-.stSlider>div>div>div{background:var(--saffron)!important;}
+/* SIDEBAR OVERRIDES */
+section[data-testid="stSidebar"] {
+    background: var(--surface) !important;
+    border-right: 1px solid var(--border) !important;
+}
+section[data-testid="stSidebar"] * { color: var(--text) !important; }
+section[data-testid="stSidebar"] label { font-weight: 600 !important; font-size: 0.85rem !important; color: var(--muted) !important; }
+.stSelectbox > div > div, .stTextInput > div > input, .stNumberInput > div > input {
+    background: var(--surface2) !important;
+    border-color: var(--border) !important;
+    color: var(--text) !important;
+    border-radius: 8px !important;
+}
+.stSlider > div > div > div { background: var(--saffron) !important; }
 
 /* BUTTON */
-.stButton>button{
-    background:linear-gradient(135deg,#F97316,#EA580C)!important;color:#fff!important;
-    border:none!important;border-radius:10px!important;padding:11px 26px!important;
-    font-weight:700!important;font-family:'Syne',sans-serif!important;font-size:1rem!important;
-    box-shadow:0 4px 16px rgba(249,115,22,.25)!important;transition:all .2s!important;
+.stButton > button {
+    background: linear-gradient(135deg, #F97316, #EA580C) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 10px !important;
+    padding: 12px 28px !important;
+    font-weight: 700 !important;
+    font-family: 'Syne', sans-serif !important;
+    font-size: 1rem !important;
+    letter-spacing: 0.5px !important;
+    box-shadow: 0 4px 16px rgba(249,115,22,0.25) !important;
+    transition: all 0.2s !important;
 }
-.stButton>button:hover{transform:translateY(-2px)!important;box-shadow:0 8px 24px rgba(249,115,22,.4)!important;}
-.stProgress>div>div{background:var(--saffron)!important;}
-h1,h2,h3,h4{font-family:'Syne',sans-serif!important;color:var(--text)!important;}
+.stButton > button:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 8px 24px rgba(249,115,22,0.4) !important;
+}
+
+.stProgress > div > div { background: var(--saffron) !important; }
+.stAlert { border-radius: 10px !important; }
+h1,h2,h3,h4 { font-family: 'Syne', sans-serif !important; color: var(--text) !important; }
+
+.debug-panel {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin-top: 12px;
+    max-height: 200px;
+    overflow-y: auto;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -204,28 +358,28 @@ class BubbleResult:
 @dataclass
 class OMRResult:
     bubbles: List[BubbleResult]
-    correct: int = 0; wrong: int = 0; unattempted: int = 0; multi: int = 0
-    pos_score: float = 0; neg_score: float = 0; total_score: float = 0
+    correct: int = 0
+    wrong: int = 0
+    unattempted: int = 0
+    multi: int = 0
+    pos_score: float = 0
+    neg_score: float = 0
+    total_score: float = 0
     debug_log: List[str] = field(default_factory=list)
-    questions_found: int = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  PRECISE OMR ENGINE v4.0
-#  Anchor-Square Based Detection
-#
-#  The official sheet has:  ■  A○  B○  C○  D○  ■  per row
-#  Strategy: find solid ■ squares → use them as perfect position anchors
-#  → interpolate A/B/C/D bubble positions between anchors
+#  ULTRA PRO OMR ENGINE v3.0
+#  Multi-strategy detection with adaptive thresholding, Hough circles,
+#  contour analysis, perspective correction, and confidence scoring.
 # ═══════════════════════════════════════════════════════════════════════════════
-class PreciseOMREngine:
+class UltraOMREngine:
 
     def __init__(self):
         self.debug_log = []
 
-    def log(self, msg: str, level: str = 'info'):
-        tag = {'info': '[INFO]', 'ok': '[OK]', 'warn': '[WARN]', 'err': '[ERR]'}.get(level, '[INFO]')
-        self.debug_log.append(f"{tag} {msg}")
+    def log(self, msg: str):
+        self.debug_log.append(msg)
 
     # ── Image Loading ──────────────────────────────────────────────────────────
     def pdf_to_image(self, pdf_bytes: bytes, dpi: int = 300) -> np.ndarray:
@@ -234,554 +388,585 @@ class PreciseOMREngine:
         mat = fitz.Matrix(dpi / 72, dpi / 72)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        self.log(f"PDF loaded at {dpi} DPI → {pix.width}×{pix.height}px", 'ok')
         return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
     def pil_to_cv(self, pil_img: Image.Image) -> np.ndarray:
-        img = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
-        self.log(f"Image loaded: {img.shape[1]}×{img.shape[0]}px", 'ok')
-        return img
+        return cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
 
-    # ── Preprocessing ─────────────────────────────────────────────────────────
-    def make_thresh(self, img: np.ndarray):
-        """Returns (gray, binary_inv_thresh, adaptive_thresh)"""
+    # ── Pre-processing Pipeline ───────────────────────────────────────────────
+    def preprocess(self, img: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Returns: gray, adaptive-thresh, otsu-thresh"""
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Sharp binary threshold for finding solid black squares
-        _, binary_inv = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
-        # Adaptive threshold for measuring bubble fills
-        adaptive = cv2.adaptiveThreshold(
-            cv2.GaussianBlur(gray, (3, 3), 0), 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 19, 6
-        )
-        return gray, binary_inv, adaptive
 
-    # ── STEP 1: Find Solid Black Anchor Squares (■) ───────────────────────────
-    def find_anchor_squares(self, binary_inv: np.ndarray, img_shape: tuple) -> List[dict]:
-        """
-        The OMR sheet has solid black filled squares ■ on BOTH sides of each row.
-        These are machine-printed and highly reliable anchors.
-        Filter by: solid fill > 75%, roughly square aspect, appropriate size.
-        """
+        # Denoise
+        denoised = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
+
+        # Adaptive threshold - great for uneven lighting/scanned docs
+        adaptive = cv2.adaptiveThreshold(
+            denoised, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 21, 5
+        )
+
+        # OTSU for clean prints
+        blur = cv2.GaussianBlur(denoised, (5, 5), 0)
+        _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # Morphological close to connect bubble outlines
+        k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        adaptive = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, k3)
+        otsu = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, k3)
+
+        return gray, adaptive, otsu
+
+    # ── Perspective Correction ────────────────────────────────────────────────
+    def deskew(self, img: np.ndarray) -> np.ndarray:
+        """Correct slight rotation using Hough lines."""
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=200)
+        if lines is None:
+            return img
+        angles = []
+        for rho, theta in lines[:, 0]:
+            angle = (theta * 180 / np.pi) - 90
+            if abs(angle) < 10:  # Only small angles
+                angles.append(angle)
+        if not angles:
+            return img
+        median_angle = np.median(angles)
+        if abs(median_angle) < 0.3:
+            return img
+        self.log(f"Deskew: rotating {median_angle:.2f}°")
+        h, w = img.shape[:2]
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), median_angle, 1.0)
+        return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    # ── Circle Detection via Hough ─────────────────────────────────────────────
+    def detect_circles_hough(self, gray: np.ndarray, img_shape: tuple) -> list:
+        """Detect circular bubbles using Hough Circle Transform."""
         H, W = img_shape[:2]
-        contours, _ = cv2.findContours(binary_inv, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        
-        squares = []
+        # Estimate bubble radius from image size (typical OMR sheet)
+        min_r = max(6, int(min(H, W) * 0.008))
+        max_r = max(22, int(min(H, W) * 0.022))
+
+        blurred = cv2.GaussianBlur(gray, (5, 5), 1.5)
+        circles = cv2.HoughCircles(
+            blurred,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=int(min_r * 1.8),
+            param1=60,
+            param2=28,
+            minRadius=min_r,
+            maxRadius=max_r
+        )
+        results = []
+        if circles is not None:
+            for x, y, r in circles[0]:
+                results.append({
+                    'x': int(x), 'y': int(y),
+                    'r': int(r), 'w': int(r * 2), 'h': int(r * 2),
+                    'method': 'hough',
+                    'bbox': (int(x - r), int(y - r), int(r * 2), int(r * 2))
+                })
+        self.log(f"Hough circles: {len(results)}")
+        return results
+
+    # ── Contour-based Bubble Detection ────────────────────────────────────────
+    def detect_circles_contour(self, thresh: np.ndarray) -> list:
+        """Detect bubbles using contour circularity filtering."""
+        contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        results = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            # Size filter: squares shouldn't be too tiny or too large
-            # At 300 DPI, the timing squares are roughly 10-20px each side
-            min_area = max(60, (W * H) * 0.00005)
-            max_area = max(1200, (W * H) * 0.0008)
-            if area < min_area or area > max_area:
+            if area < 50 or area > 12000:
                 continue
-
-            x, y, w, h = cv2.boundingRect(cnt)
-            if w < 6 or h < 6:
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter == 0:
                 continue
-
-            aspect = w / float(h)
-            if not (0.45 < aspect < 2.2):  # Must be roughly square
+            # Circularity: 4π·Area / Perimeter²  (1.0 = perfect circle)
+            circularity = (4 * np.pi * area) / (perimeter ** 2)
+            if circularity < 0.40:  # Reasonably circular
                 continue
-
-            # FILL CHECK: Solid black square must be mostly filled
-            roi = binary_inv[y:y+h, x:x+w]
-            fill_ratio = np.count_nonzero(roi) / roi.size if roi.size > 0 else 0
-            if fill_ratio < 0.65:
+            (x, y, w, h) = cv2.boundingRect(cnt)
+            aspect = w / float(h) if h > 0 else 0
+            if not (0.5 < aspect < 2.0):
                 continue
-
-            # Exclude the header/footer regions
-            if y < H * 0.12 or y > H * 0.92:
-                continue
-
             cx, cy = x + w // 2, y + h // 2
-            squares.append({
-                'x': x, 'y': y, 'w': w, 'h': h,
-                'cx': cx, 'cy': cy,
-                'area': area, 'fill': fill_ratio,
+            r = max(w, h) // 2
+            results.append({
+                'x': cx, 'y': cy, 'r': r, 'w': w, 'h': h,
+                'area': area, 'circularity': circularity,
+                'method': 'contour',
                 'bbox': (x, y, w, h)
             })
+        self.log(f"Contour circles: {len(results)}")
+        return results
 
-        self.log(f"Raw anchor squares found: {len(squares)}", 'info')
-        return squares
+    # ── Merge & Deduplicate Detections ────────────────────────────────────────
+    def merge_detections(self, hough: list, contour: list, dist_thresh: float = 8.0) -> list:
+        """Combine Hough and contour detections, prefer Hough, dedup by proximity."""
+        merged = list(hough)
+        for c in contour:
+            too_close = False
+            for m in merged:
+                d = np.hypot(c['x'] - m['x'], c['y'] - m['y'])
+                if d < dist_thresh:
+                    too_close = True
+                    break
+            if not too_close:
+                merged.append(c)
+        self.log(f"Merged detections: {len(merged)}")
+        return merged
 
-    # ── STEP 2: Classify Squares as LEFT or RIGHT Anchors ────────────────────
-    def classify_anchors(self, squares: List[dict], img_shape: tuple) -> Tuple[List[dict], List[dict]]:
+    # ── Grid Layout Analysis ──────────────────────────────────────────────────
+    def build_question_grid(self, detections: list, img_shape: tuple) -> dict:
         """
-        The sheet has 3 column groups. In each group:
-          LEFT anchor ■ is at x ≈ col_left_edge
-          RIGHT anchor ■ is at x ≈ col_right_edge
-        Strategy: cluster by x-position to find left vs right anchors per column
+        Robust grid builder:
+        1. Remove margin noise (top title, bottom signatures)
+        2. Estimate bubble size from median
+        3. Divide into 3 columns by x-coordinate quantiles
+        4. Within each column, cluster into rows using y-coordinate
+        5. Within each row, identify 4 options (A/B/C/D) by x-position
+        6. For missing bubbles: interpolate from learned inter-bubble spacing
         """
-        H, W = img_shape[:2]
-        if not squares:
-            return [], []
-
-        # Sort by x
-        xs = sorted(set(s['cx'] for s in squares))
-        
-        # Median square width — used to group x-positions
-        med_w = int(np.median([s['w'] for s in squares]))
-        
-        # Cluster x-positions using gap detection
-        x_clusters = []
-        curr = [xs[0]]
-        for xv in xs[1:]:
-            if xv - curr[-1] < med_w * 3:
-                curr.append(xv)
-            else:
-                x_clusters.append(curr)
-                curr = [xv]
-        x_clusters.append(curr)
-        
-        # Find median x for each cluster
-        cluster_centers = [int(np.median(c)) for c in x_clusters]
-        self.log(f"X-clusters at: {cluster_centers}", 'info')
-
-        # The sheet has 3 columns, each with a LEFT and RIGHT anchor
-        # So we expect ~6 distinct x-positions
-        # Left anchors: left side of each column group
-        # Right anchors: right side of each column group
-        # Column 1: Q1-Q20  |  Column 2: Q21-Q40  |  Column 3: Q41-Q60
-        # Each column section: L_anchor ... [A][B][C][D] ... R_anchor
-        
-        # Assign each square to nearest cluster center
-        for sq in squares:
-            dists = [abs(sq['cx'] - cc) for cc in cluster_centers]
-            sq['x_cluster'] = np.argmin(dists)
-        
-        # Split image into 3 vertical sections
-        col_w = W / 3.0
-        for sq in squares:
-            if sq['cx'] < col_w:
-                sq['col_section'] = 0
-            elif sq['cx'] < 2 * col_w:
-                sq['col_section'] = 1
-            else:
-                sq['col_section'] = 2
-
-        # Within each column section, leftmost x-cluster = LEFT anchor, rightmost = RIGHT anchor
-        left_anchors = []
-        right_anchors = []
-
-        for col_sec in range(3):
-            col_sqs = [s for s in squares if s['col_section'] == col_sec]
-            if not col_sqs:
-                continue
-            col_x_clusters = sorted(set(s['x_cluster'] for s in col_sqs))
-            if len(col_x_clusters) >= 2:
-                left_cl = min(col_x_clusters)
-                right_cl = max(col_x_clusters)
-                for sq in col_sqs:
-                    if sq['x_cluster'] == left_cl:
-                        sq['anchor_type'] = 'left'
-                        left_anchors.append(sq)
-                    elif sq['x_cluster'] == right_cl:
-                        sq['anchor_type'] = 'right'
-                        right_anchors.append(sq)
-            elif len(col_x_clusters) == 1:
-                # Only one x-cluster in this column section — treat as left
-                for sq in col_sqs:
-                    sq['anchor_type'] = 'left'
-                    left_anchors.append(sq)
-
-        self.log(f"Left anchors: {len(left_anchors)}, Right anchors: {len(right_anchors)}", 'ok')
-        return left_anchors, right_anchors
-
-    # ── STEP 3: Build Precise Question Grid ───────────────────────────────────
-    def build_precise_grid(self, left_anchors: List[dict], right_anchors: List[dict],
-                            img_shape: tuple) -> Dict[int, dict]:
-        """
-        For each left anchor (one per question row):
-        - Find the corresponding right anchor (same y, same column section)
-        - The 4 bubbles A/B/C/D are evenly spaced between left_anchor.right_edge and right_anchor.left_edge
-        - Relative positions from the official sheet: A ≈ 25%, B ≈ 42%, C ≈ 58%, D ≈ 75% of span
-
-        Returns: { q_num: { 'A': bubble_dict, 'B': ..., 'C': ..., 'D': ..., 'left': ..., 'right': ... } }
-        """
-        H, W = img_shape[:2]
-        if not left_anchors:
-            self.log("No left anchors found — cannot build grid!", 'err')
+        if not detections:
             return {}
 
-        # Sort left anchors by (col_section, y)
-        left_anchors.sort(key=lambda s: (s['col_section'], s['cy']))
+        H, W = img_shape[:2]
+        # Content region: skip top 12% (header) and bottom 8% (footer)
+        y_min = int(H * 0.12)
+        y_max = int(H * 0.92)
+        pts = [d for d in detections if y_min < d['y'] < y_max]
+        if not pts:
+            self.log("No detections in content region")
+            return {}
 
-        # Build a lookup: right anchors by (col_section, approximate_y)
-        right_by_col = {0: [], 1: [], 2: []}
-        for ra in right_anchors:
-            right_by_col[ra['col_section']].append(ra)
+        # Estimate typical bubble radius
+        radii = [d['r'] for d in pts]
+        med_r = int(np.median(radii))
+        self.log(f"Median bubble radius: {med_r}px")
 
-        # Bubble relative positions within the span from left_anchor right-edge to right_anchor left-edge
-        # From the official sheet analysis: 4 bubbles roughly at 20%, 40%, 60%, 80% of span
-        # More precisely, the bubbles span most of the inter-anchor gap
-        # We use a 5-division model: [0.18, 0.38, 0.58, 0.78] relative positions
-        OPTION_RATIOS = [0.18, 0.38, 0.58, 0.78]
+        # ── Column Assignment ─────────────────────────────────────────────────
+        # Use x-coord quantiles to find natural column boundaries
+        xs = sorted([d['x'] for d in pts])
+        # Three columns: divide x-space into thirds using 33rd/66th percentile
+        p33 = np.percentile(xs, 33)
+        p66 = np.percentile(xs, 66)
+        col_bounds = [0, p33, p66, W]
+
+        cols = [[] for _ in range(3)]
+        for d in pts:
+            if d['x'] < p33:
+                cols[0].append(d)
+            elif d['x'] < p66:
+                cols[1].append(d)
+            else:
+                cols[2].append(d)
+
+        self.log(f"Column sizes: {[len(c) for c in cols]}")
 
         question_map = {}
-        q_counter = {0: 1, 1: 21, 2: 41}  # Starting q_num per col_section
 
-        # Group left anchors by column section
-        by_col = {0: [], 1: [], 2: []}
-        for la in left_anchors:
-            by_col[la['col_section']].append(la)
-
-        for col_sec in range(3):
-            col_left = by_col[col_sec]
-            col_right = right_by_col[col_sec]
-            
-            if not col_left:
+        for col_idx, col_pts in enumerate(cols):
+            if not col_pts:
                 continue
 
-            col_left.sort(key=lambda s: s['cy'])
-            col_right_sorted = sorted(col_right, key=lambda s: s['cy']) if col_right else []
+            q_offset = col_idx * 20 + 1
 
-            # Learn bubble radius from anchor square sizes
-            med_sq_h = int(np.median([s['h'] for s in col_left]))
-            bubble_r = max(8, int(med_sq_h * 0.7))
+            # ── Row Clustering ────────────────────────────────────────────────
+            # Sort by y, then cluster with gap detection
+            col_pts.sort(key=lambda d: d['y'])
+            row_gap = med_r * 2.8
 
-            # For each left anchor, find the best matching right anchor (closest y)
-            for row_idx, la in enumerate(col_left[:20]):
-                q_num = q_counter[col_sec] + row_idx
-
-                # Find best right anchor for this row
-                best_ra = None
-                if col_right_sorted:
-                    best_ra = min(col_right_sorted, key=lambda r: abs(r['cy'] - la['cy']))
-                    # Only use if it's within reasonable vertical distance
-                    if abs(best_ra['cy'] - la['cy']) > med_sq_h * 3:
-                        best_ra = None
-
-                # Compute span
-                if best_ra is not None:
-                    span_x_start = la['x'] + la['w']   # Right edge of left anchor
-                    span_x_end = best_ra['x']           # Left edge of right anchor
-                    row_y = (la['cy'] + best_ra['cy']) // 2
+            rows = []
+            curr_row = [col_pts[0]]
+            for d in col_pts[1:]:
+                row_mean_y = np.mean([p['y'] for p in curr_row])
+                if abs(d['y'] - row_mean_y) < row_gap:
+                    curr_row.append(d)
                 else:
-                    # No right anchor: estimate span from column width
-                    col_width = W / 3.0
-                    span_x_start = la['x'] + la['w']
-                    span_x_end = int(la['cx'] + col_width * 0.75)
-                    row_y = la['cy']
+                    rows.append(curr_row)
+                    curr_row = [d]
+            rows.append(curr_row)
 
-                span = span_x_end - span_x_start
-                if span < 20:
-                    # Fallback span
-                    span = int(W / 6)
-                    span_x_end = span_x_start + span
+            self.log(f"Col {col_idx}: {len(rows)} rows detected")
 
+            # Filter to rows with 1–6 detections (avoid noise rows)
+            rows = [r for r in rows if 1 <= len(r) <= 8]
+
+            # Sort rows by mean y
+            rows.sort(key=lambda r: np.mean([d['y'] for d in r]))
+
+            # Cap at 20 questions per column
+            rows = rows[:20]
+
+            if not rows:
+                continue
+
+            # ── Learn Option Spacing from rows with exactly 4 detections ─────
+            ref_spacings = []
+            for row in rows:
+                row.sort(key=lambda d: d['x'])
+                if len(row) == 4:
+                    xs_row = [d['x'] for d in row]
+                    spacings = [xs_row[i+1] - xs_row[i] for i in range(3)]
+                    if all(5 < s < W * 0.25 for s in spacings):
+                        ref_spacings.append(xs_row)
+
+            if ref_spacings:
+                # Learn relative positions: normalize to first option = 0
+                norm_positions = []
+                for r in ref_spacings:
+                    base = r[0]
+                    norm_positions.append([x - base for x in r])
+                median_offsets = np.median(norm_positions, axis=0)
+                self.log(f"Col {col_idx}: learned offsets {median_offsets.astype(int).tolist()}")
+            else:
+                # Fallback: estimate from column width
+                col_width = col_bounds[col_idx + 1] - col_bounds[col_idx]
+                spacing = col_width * 0.18
+                median_offsets = np.array([0, spacing, spacing * 2, spacing * 3])
+                self.log(f"Col {col_idx}: fallback offsets {median_offsets.astype(int).tolist()}")
+
+            # ── Assign A/B/C/D to each row using learned offsets ─────────────
+            for row_idx, row in enumerate(rows):
+                q_num = q_offset + row_idx
+                row.sort(key=lambda d: d['x'])
                 opts = {}
-                for i, opt in enumerate(['A', 'B', 'C', 'D']):
-                    cx = int(span_x_start + OPTION_RATIOS[i] * span)
-                    cy = int(row_y)
-                    opts[opt] = {
-                        'x': cx, 'y': cy, 'r': bubble_r,
-                        'bbox': (cx - bubble_r, cy - bubble_r, bubble_r * 2, bubble_r * 2)
-                    }
-                opts['_left_anchor'] = la
-                opts['_right_anchor'] = best_ra
+
+                if len(row) >= 4:
+                    # Use the 4 best candidates sorted by x
+                    candidates = sorted(row, key=lambda d: d['x'])[:4]
+                    for i, opt in enumerate(['A', 'B', 'C', 'D']):
+                        if i < len(candidates):
+                            d = candidates[i]
+                            opts[opt] = {
+                                'x': d['x'], 'y': d['y'],
+                                'r': d.get('r', med_r),
+                                'w': d['w'], 'h': d['h'],
+                                'bbox': d['bbox'],
+                                'interpolated': False
+                            }
+                else:
+                    # Anchor: use leftmost detected bubble
+                    anchor = min(row, key=lambda d: d['x'])
+                    anchor_x, anchor_y = anchor['x'], anchor['y']
+
+                    for i, opt in enumerate(['A', 'B', 'C', 'D']):
+                        target_x = int(anchor_x + median_offsets[i])
+                        # Check if any detection is near this expected position
+                        best_match = None
+                        best_dist = med_r * 2.0
+                        for d in row:
+                            dist = abs(d['x'] - target_x)
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_match = d
+
+                        if best_match:
+                            opts[opt] = {
+                                'x': best_match['x'], 'y': best_match['y'],
+                                'r': best_match.get('r', med_r),
+                                'w': best_match['w'], 'h': best_match['h'],
+                                'bbox': best_match['bbox'],
+                                'interpolated': False
+                            }
+                        else:
+                            # INTERPOLATE: place virtual bubble at expected position
+                            r = med_r
+                            opts[opt] = {
+                                'x': target_x, 'y': anchor_y,
+                                'r': r, 'w': r * 2, 'h': r * 2,
+                                'bbox': (target_x - r, anchor_y - r, r * 2, r * 2),
+                                'interpolated': True
+                            }
+
                 question_map[q_num] = opts
 
-        self.log(f"Grid built: {len(question_map)} questions mapped", 'ok')
+        self.log(f"Total questions mapped: {len(question_map)}")
         return question_map
 
-    # ── STEP 4: Calibrate Bubble Positions ────────────────────────────────────
-    def calibrate_bubble_positions(self, question_map: Dict, gray: np.ndarray, adaptive: np.ndarray) -> Dict:
+    # ── Fill Measurement (Multi-Strategy) ─────────────────────────────────────
+    def measure_fill_robust(self, gray: np.ndarray, bubble: dict,
+                             adaptive: np.ndarray, otsu: np.ndarray) -> Tuple[float, float]:
         """
-        Fine-tune bubble positions: for each question row, find actual circles
-        near the expected positions using local circle detection.
-        This corrects any slight scanner skew or layout variation.
+        Returns (fill_ratio, confidence) using multiple threshold strategies.
+        Takes the max fill ratio from adaptive + otsu approaches.
         """
+        x, y, w, h = bubble['bbox']
+        r = bubble.get('r', max(w, h) // 2)
+        pad = max(2, r // 4)
+
         H, W = gray.shape[:2]
-        calibrated_map = {}
-
-        for q_num, opts in question_map.items():
-            new_opts = {}
-            for opt in ['A', 'B', 'C', 'D']:
-                if opt not in opts:
-                    continue
-                b = opts[opt]
-                cx, cy, r = b['x'], b['y'], b['r']
-                
-                # Search window around expected position
-                search_pad = max(r, 12)
-                x1 = max(0, cx - search_pad * 2)
-                y1 = max(0, cy - search_pad)
-                x2 = min(W, cx + search_pad * 2)
-                y2 = min(H, cy + search_pad)
-
-                roi_gray = gray[y1:y2, x1:x2]
-                if roi_gray.size == 0:
-                    new_opts[opt] = b
-                    continue
-
-                # Try Hough circles in the local search window
-                roi_blur = cv2.GaussianBlur(roi_gray, (3, 3), 1)
-                circles = cv2.HoughCircles(
-                    roi_blur, cv2.HOUGH_GRADIENT, dp=1.0,
-                    minDist=r, param1=50, param2=20,
-                    minRadius=max(4, r - 6), maxRadius=r + 8
-                )
-
-                if circles is not None:
-                    # Find closest circle to expected position
-                    best_circle = None
-                    best_dist = search_pad * 1.5
-                    for x_, y_, r_ in circles[0]:
-                        global_cx = int(x1 + x_)
-                        global_cy = int(y1 + y_)
-                        dist = np.hypot(global_cx - cx, global_cy - cy)
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_circle = (global_cx, global_cy, int(r_))
-
-                    if best_circle is not None:
-                        ncx, ncy, nr = best_circle
-                        new_opts[opt] = {
-                            'x': ncx, 'y': ncy, 'r': nr,
-                            'bbox': (ncx - nr, ncy - nr, nr * 2, nr * 2),
-                            'calibrated': True
-                        }
-                        continue
-
-                # No local circle found — keep original
-                new_opts[opt] = {**b, 'calibrated': False}
-
-            new_opts['_left_anchor'] = opts.get('_left_anchor')
-            new_opts['_right_anchor'] = opts.get('_right_anchor')
-            calibrated_map[q_num] = new_opts
-
-        calibrated = sum(1 for opts in calibrated_map.values()
-                        for opt in ['A','B','C','D']
-                        if opt in opts and opts[opt].get('calibrated'))
-        self.log(f"Calibrated {calibrated}/{len(calibrated_map)*4} bubble positions", 'ok')
-        return calibrated_map
-
-    # ── STEP 5: Measure Bubble Fill ───────────────────────────────────────────
-    def measure_fill(self, gray: np.ndarray, adaptive: np.ndarray, bubble: dict) -> float:
-        """
-        Multi-method fill measurement inside an elliptical mask:
-        1. Adaptive threshold fill
-        2. Intensity darkness vs background
-        Returns combined fill score [0.0, 1.0]
-        """
-        cx, cy, r = bubble['x'], bubble['y'], bubble.get('r', 10)
-        H, W = gray.shape[:2]
-
-        # Slightly tighter mask (inner 80% of radius) to avoid circle outline interference
-        r_inner = max(3, int(r * 0.80))
-        x1 = max(0, cx - r_inner)
-        y1 = max(0, cy - r_inner)
-        x2 = min(W, cx + r_inner)
-        y2 = min(H, cy + r_inner)
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(W, x + w + pad)
+        y2 = min(H, y + h + pad)
 
         if x2 <= x1 or y2 <= y1:
-            return 0.0
+            return 0.0, 0.0
 
-        # Create circular mask
-        h_roi, w_roi = y2 - y1, x2 - x1
-        mask = np.zeros((h_roi, w_roi), dtype=np.uint8)
-        local_cx, local_cy = cx - x1, cy - y1
-        cv2.circle(mask, (local_cx, local_cy), r_inner, 255, -1)
-        
+        roi_gray = gray[y1:y2, x1:x2]
+        roi_adaptive = adaptive[y1:y2, x1:x2]
+        roi_otsu = otsu[y1:y2, x1:x2]
+
+        if roi_gray.size == 0:
+            return 0.0, 0.0
+
+        # Create elliptical mask for precise measurement inside the bubble
+        cy_local = (y2 - y1) // 2
+        cx_local = (x2 - x1) // 2
+        ry = max(1, (y2 - y1) // 2 - 1)
+        rx = max(1, (x2 - x1) // 2 - 1)
+        mask = np.zeros(roi_gray.shape[:2], dtype=np.uint8)
+        cv2.ellipse(mask, (cx_local, cy_local), (rx, ry), 0, 0, 360, 255, -1)
+
         total_px = np.count_nonzero(mask)
         if total_px == 0:
-            return 0.0
+            return 0.0, 0.0
 
         # Method 1: Adaptive threshold fill
-        roi_adaptive = adaptive[y1:y2, x1:x2]
         filled_adaptive = np.count_nonzero(roi_adaptive & (mask > 0))
         ratio_adaptive = filled_adaptive / total_px
 
-        # Method 2: Intensity-based darkness
-        roi_gray = gray[y1:y2, x1:x2]
-        pixel_vals = roi_gray[mask > 0]
-        if len(pixel_vals) == 0:
-            return ratio_adaptive
+        # Method 2: OTSU fill
+        filled_otsu = np.count_nonzero(roi_otsu & (mask > 0))
+        ratio_otsu = filled_otsu / total_px
 
-        mean_intensity = np.mean(pixel_vals)
-        # Background brightness estimate (use sheet edges)
-        sheet_brightness = np.percentile(gray, 90)  # 90th percentile ≈ blank paper
-        darkness = max(0.0, (sheet_brightness - mean_intensity) / max(sheet_brightness, 1))
-
-        # Method 3: Count very dark pixels (< 128) inside bubble
-        dark_px = np.count_nonzero(pixel_vals < 128)
-        dark_ratio = dark_px / total_px
+        # Method 3: Direct intensity analysis
+        # A filled bubble should be darker than average sheet brightness
+        sheet_mean = np.mean(gray)  # Approximate sheet brightness
+        roi_mean = np.mean(roi_gray[mask > 0])
+        # Darkness ratio: how much darker than sheet mean
+        darkness_ratio = max(0.0, (sheet_mean - roi_mean) / sheet_mean) if sheet_mean > 0 else 0.0
 
         # Weighted combination
-        fill = ratio_adaptive * 0.45 + darkness * 0.30 + dark_ratio * 0.25
-        return min(1.0, max(0.0, fill))
+        fill_ratio = max(ratio_adaptive, ratio_otsu) * 0.65 + darkness_ratio * 0.35
 
-    # ── STEP 6: Classify Selections ───────────────────────────────────────────
-    def classify_row(self, fills: dict, fill_thresh: float) -> List[str]:
+        # Confidence: how consistent are the methods?
+        variance = np.var([ratio_adaptive, ratio_otsu, darkness_ratio])
+        confidence = max(0.0, 1.0 - variance * 4)
+
+        return fill_ratio, confidence
+
+    # ── Classification with Adaptive Threshold ────────────────────────────────
+    def classify_bubbles_adaptive(self, gray: np.ndarray, question_map: dict,
+                                   adaptive: np.ndarray, otsu: np.ndarray,
+                                   fill_thresh: float = 0.25) -> dict:
         """
-        Smart classification:
-        - If max_fill < fill_thresh * 0.5: definitely unattempted
-        - If one bubble dominates (≥1.8× second highest): single selection
-        - If multiple above threshold and close in value: multi-mark
+        Smart bubble classification:
+        - Compute fill ratios for all bubbles in a question
+        - Use adaptive cut-off: if max fill >> others, it's clearly selected
+        - Relative thresholding: selected = fill > 2× mean_fill AND > absolute threshold
         """
-        if not fills:
-            return []
+        results = {}
 
-        max_fill = max(fills.values())
+        for q, opts in question_map.items():
+            fills = {}
+            confidences = {}
+            for opt in ['A', 'B', 'C', 'D']:
+                if opt not in opts:
+                    continue
+                f, c = self.measure_fill_robust(gray, opts[opt], adaptive, otsu)
+                fills[opt] = f
+                confidences[opt] = c
 
-        # Clearly unattempted
-        if max_fill < fill_thresh * 0.4:
-            return []
+            if not fills:
+                results[q] = {'selected': [], 'fills': fills, 'confidences': confidences}
+                continue
 
-        # Sort fills
-        sorted_fills = sorted(fills.items(), key=lambda x: x[1], reverse=True)
+            # ── Adaptive selection logic ──────────────────────────────────────
+            max_fill = max(fills.values())
+            mean_fill = np.mean(list(fills.values()))
+            fill_vals = list(fills.values())
+            fill_vals.sort(reverse=True)
 
-        # Single clear selection
-        if len(sorted_fills) >= 2:
-            top, second = sorted_fills[0][1], sorted_fills[1][1]
-            if top >= fill_thresh:
-                dominance = top / (second + 1e-6)
-                if dominance >= 1.8:
-                    return [sorted_fills[0][0]]
+            # Dynamic threshold: between absolute floor and relative assessment
+            # If the sheet has a very dark background, use relative mode
+            relative_thresh = mean_fill * 2.2  # Must be 2.2× above average
+            effective_thresh = max(fill_thresh, min(relative_thresh, fill_thresh * 2.5))
 
-        # Multiple selections above threshold
-        above = [opt for opt, f in fills.items() if f >= fill_thresh]
-        if above:
-            return above
+            # Selection: must exceed effective threshold OR be clearly dominant
+            selected = []
+            for opt, f in fills.items():
+                is_above_abs = f >= fill_thresh
+                is_dominant = (max_fill > 0.10) and (f >= max_fill * 0.75) and (f >= fill_thresh * 0.7)
+                if is_above_abs or is_dominant:
+                    selected.append((opt, f))
 
-        # Fallback: only top selection if above half-threshold
-        if sorted_fills[0][1] >= fill_thresh * 0.5:
-            return [sorted_fills[0][0]]
+            # If multiple are "selected" but one is clearly dominant, keep only that
+            if len(selected) > 1:
+                max_among_selected = max(s[1] for s in selected)
+                # If top bubble is 1.5× the second, it's the only selection
+                selected_sorted = sorted(selected, key=lambda s: s[1], reverse=True)
+                if len(selected_sorted) >= 2:
+                    ratio = selected_sorted[0][1] / (selected_sorted[1][1] + 1e-6)
+                    if ratio > 1.8:
+                        selected = [selected_sorted[0]]
 
-        return []
+            selected_opts = [s[0] for s in selected]
 
-    # ── MAIN GRADE PIPELINE ───────────────────────────────────────────────────
+            results[q] = {
+                'selected': selected_opts,
+                'fills': fills,
+                'confidences': confidences
+            }
+
+        return results
+
+    # ── Measure Fill for Annotated Debug Display ──────────────────────────────
+    def measure_fill_otsu(self, otsu: np.ndarray, bubble: dict) -> float:
+        """Simple OTSU fill for annotation purposes."""
+        x, y, w, h = bubble['bbox']
+        pad = 2
+        H, W = otsu.shape[:2]
+        x1, y1 = max(0, x - pad), max(0, y - pad)
+        x2, y2 = min(W, x + w + pad), min(H, y + h + pad)
+        roi = otsu[y1:y2, x1:x2]
+        if roi.size == 0:
+            return 0.0
+        return np.count_nonzero(roi) / roi.size
+
+    # ── Main Grade Pipeline ────────────────────────────────────────────────────
     def grade(self, img: np.ndarray, answer_key: dict,
               pos: float = 3.0, neg: float = 1.0,
-              fill_thresh: float = 0.22) -> Tuple[OMRResult, np.ndarray]:
+              fill_thresh: float = 0.25) -> Tuple[OMRResult, np.ndarray]:
 
         self.debug_log = []
-        self.log(f"=== GRADING START === shape={img.shape}", 'info')
+        self.log(f"Image shape: {img.shape}")
 
-        # Preprocess
-        gray, binary_inv, adaptive = self.make_thresh(img)
+        # Step 1: Deskew
+        img = self.deskew(img)
 
-        # Step 1: Find solid anchor squares
-        squares = self.find_anchor_squares(binary_inv, img.shape)
+        # Step 2: Preprocess
+        gray, adaptive, otsu = self.preprocess(img)
 
-        # Step 2: Classify as left/right anchors
-        left_anchors, right_anchors = self.classify_anchors(squares, img.shape)
+        # Step 3: Multi-strategy circle detection
+        hough_circles = self.detect_circles_hough(gray, img.shape)
+        contour_circles = self.detect_circles_contour(adaptive)
+        contour_circles_otsu = self.detect_circles_contour(otsu)
 
-        # Step 3: Build grid using anchor-based interpolation
-        question_map = self.build_precise_grid(left_anchors, right_anchors, img.shape)
+        # Merge all detections
+        all_detections = self.merge_detections(hough_circles, contour_circles, dist_thresh=8)
+        all_detections = self.merge_detections(all_detections, contour_circles_otsu, dist_thresh=8)
 
-        # Step 4: Calibrate using local Hough (fine-tune positions)
-        question_map = self.calibrate_bubble_positions(question_map, gray, adaptive)
+        self.log(f"Total unique detections: {len(all_detections)}")
 
-        # Step 5 & 6: Measure fills and classify
+        # Step 4: Build grid
+        question_map = self.build_question_grid(all_detections, img.shape)
+
+        # Step 5: Classify with adaptive thresholding
+        bubble_results_raw = self.classify_bubbles_adaptive(
+            gray, question_map, adaptive, otsu, fill_thresh
+        )
+
+        # Step 6: Grade & Annotate
         annotated = img.copy()
         results = []
 
         for q in range(1, 61):
             key = answer_key.get(q, '')
+            raw = bubble_results_raw.get(q, {'selected': [], 'fills': {}, 'confidences': {}})
+            selected = raw.get('selected', [])
+            fills = raw.get('fills', {})
             opts_map = question_map.get(q, {})
 
-            # Measure fills for this question's bubbles
-            fills = {}
-            for opt in ['A', 'B', 'C', 'D']:
-                if opt in opts_map:
-                    fills[opt] = self.measure_fill(gray, adaptive, opts_map[opt])
-
-            selected = self.classify_row(fills, fill_thresh)
-
-            # Grade
             if len(selected) == 0:
-                status = 'unattempted'; score = 0.0
+                status = 'unattempted'
+                score = 0.0
             elif len(selected) > 1:
-                status = 'multi'; score = -neg if key else 0.0
+                status = 'multi'
+                score = -neg if key else 0.0
             elif key and selected[0] == key:
-                status = 'correct'; score = pos
+                status = 'correct'
+                score = pos
             elif key:
-                status = 'wrong'; score = -neg
+                status = 'wrong'
+                score = -neg
             else:
-                status = 'unattempted'; score = 0.0
+                status = 'unattempted'
+                score = 0.0
 
-            br = BubbleResult(q_num=q, detected=selected, answer_key=key,
-                              status=status, score=score, fill_values=fills)
+            br = BubbleResult(
+                q_num=q, detected=selected, answer_key=key,
+                status=status, score=score, fill_values=fills
+            )
             results.append(br)
 
-            # ── Annotate ──────────────────────────────────────────────────────
-            # Draw anchor squares
-            la = opts_map.get('_left_anchor')
-            ra = opts_map.get('_right_anchor')
-            if la:
-                ax, ay, aw, ah = la['bbox']
-                cv2.rectangle(annotated, (ax, ay), (ax+aw, ay+ah), (80, 80, 80), 1)
-            if ra:
-                ax, ay, aw, ah = ra['bbox']
-                cv2.rectangle(annotated, (ax, ay), (ax+aw, ay+ah), (80, 80, 80), 1)
-
-            # Status colors (BGR)
-            COLOR = {
-                'correct_sel':   (50, 210, 50),
-                'wrong_sel':     (50, 50, 230),
-                'multi_sel':     (200, 60, 230),
-                'unatt_sel':     (50, 180, 220),
-                'empty':         (110, 110, 110),
-                'correct_miss':  (50, 210, 50),
-            }
-
+            # ── Annotation ───────────────────────────────────────────────────
             for opt in ['A', 'B', 'C', 'D']:
                 if opt not in opts_map:
                     continue
-                b = opts_map[opt]
-                cx, cy, r = b['x'], b['y'], b.get('r', 10)
+                bubble = opts_map[opt]
+                cx, cy = bubble['x'], bubble['y']
+                r = bubble.get('r', max(bubble['w'], bubble['h']) // 2)
 
-                # Draw detection zone ring
-                cv2.circle(annotated, (cx, cy), r + 3, (40, 40, 60), 1)
+                is_interpolated = bubble.get('interpolated', False)
+                fill_val = fills.get(opt, 0.0)
 
                 if opt in selected:
-                    if status == 'correct':    clr = COLOR['correct_sel']
-                    elif status == 'wrong':    clr = COLOR['wrong_sel']
-                    elif status == 'multi':    clr = COLOR['multi_sel']
-                    else:                      clr = COLOR['unatt_sel']
-                    cv2.circle(annotated, (cx, cy), r, clr, -1)
-                    cv2.circle(annotated, (cx, cy), r, (255, 255, 255), 1)
+                    # Color based on outcome
+                    if status == 'correct':
+                        color = (50, 205, 50)   # Green
+                    elif status == 'wrong':
+                        color = (50, 50, 235)   # Blue-red
+                    elif status == 'multi':
+                        color = (180, 50, 220)  # Purple
+                    else:
+                        color = (50, 180, 220)  # Cyan
+                    cv2.circle(annotated, (cx, cy), r + 2, color, -1)
+                    cv2.circle(annotated, (cx, cy), r + 3, (255, 255, 255), 1)
                     cv2.putText(annotated, opt, (cx - 5, cy + 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 255, 255), 1)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
                 else:
-                    # Empty bubble — show outline + fill value
-                    cv2.circle(annotated, (cx, cy), r, (100, 100, 100), 1)
-                    fv = fills.get(opt, 0)
-                    if fv > 0.05:
-                        cv2.putText(annotated, f"{fv:.2f}", (cx - 9, cy + 3),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.24, (160, 140, 80), 1)
+                    # Unfilled: light outline, dim
+                    color = (60, 60, 60) if is_interpolated else (140, 140, 140)
+                    thickness = 1
+                    cv2.circle(annotated, (cx, cy), r, color, thickness)
+                    # Show fill value for debugging
+                    if fill_val > 0.05:
+                        cv2.putText(annotated, f"{fill_val:.2f}", (cx - 8, cy + 3),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, (200, 180, 100), 1)
 
-                # Circle the correct answer in green if it was missed
-                if key == opt and opt not in selected and status != 'correct':
-                    cv2.circle(annotated, (cx, cy), r + 5, (50, 210, 50), 2)
+                # Mark correct answer if missed
+                if key == opt and opt not in selected and status not in ('correct', 'unattempted'):
+                    cv2.circle(annotated, (cx, cy), r + 5, (50, 205, 50), 2)
 
-            # Q label
-            if la:
-                lx = max(0, la['cx'] - la['w'] * 2 - 5)
-                ly = la['cy'] + 4
-                lc_map = {'correct': (50,210,50), 'wrong': (50,50,230),
-                          'unattempted': (120,120,120), 'multi': (200,60,230)}
+            # Q number label
+            if opts_map:
+                first_opt = opts_map.get('A', list(opts_map.values())[0])
+                lx = max(0, first_opt['x'] - first_opt.get('r', 12) * 4)
+                ly = first_opt['y'] + 4
+                # Status-colored label
+                label_color = {
+                    'correct': (50, 205, 50),
+                    'wrong': (50, 50, 235),
+                    'unattempted': (140, 140, 140),
+                    'multi': (180, 50, 220)
+                }.get(status, (200, 200, 200))
                 cv2.putText(annotated, f"Q{q}", (lx, ly),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.30,
-                            lc_map.get(status, (180,180,180)), 1)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.32, label_color, 1)
 
-        # Summarize
+        # Summary stats
         correct = sum(1 for r in results if r.status == 'correct')
-        wrong   = sum(1 for r in results if r.status == 'wrong')
-        unat    = sum(1 for r in results if r.status == 'unattempted')
-        multi   = sum(1 for r in results if r.status == 'multi')
-        ps = correct * pos
-        ns = (wrong + multi) * neg
+        wrong = sum(1 for r in results if r.status == 'wrong')
+        unattempted = sum(1 for r in results if r.status == 'unattempted')
+        multi = sum(1 for r in results if r.status == 'multi')
+        pos_score = correct * pos
+        neg_score = (wrong + multi) * neg
+        total = pos_score - neg_score
 
-        self.log(f"=== RESULTS: {correct}✓ {wrong}✗ {unat}— {multi}M | Score={ps-ns:.1f} ===", 'ok')
+        self.log(f"Results: {correct}✓ {wrong}✗ {unattempted}— {multi}M → {total:.1f}")
 
-        return OMRResult(
-            bubbles=results, correct=correct, wrong=wrong, unattempted=unat, multi=multi,
-            pos_score=ps, neg_score=ns, total_score=ps - ns,
-            debug_log=list(self.debug_log),
-            questions_found=len(question_map)
-        ), annotated
+        omr_result = OMRResult(
+            bubbles=results, correct=correct, wrong=wrong,
+            unattempted=unattempted, multi=multi,
+            pos_score=pos_score, neg_score=neg_score, total_score=total,
+            debug_log=list(self.debug_log)
+        )
+        return omr_result, annotated
 
 
 # ─── Session State ─────────────────────────────────────────────────────────────
@@ -794,261 +979,357 @@ if 'original_img' not in st.session_state:
 if 'annotated_img' not in st.session_state:
     st.session_state.annotated_img = None
 
-engine = PreciseOMREngine()
+engine = UltraOMREngine()
 
-# ─── HEADER ───────────────────────────────────────────────────────────────────
+# ─── HEADER ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="omr-header">
-  <div class="tricolor"><div></div><div></div><div></div></div>
+  <div class="tricolor-bar"><div></div><div></div><div></div></div>
   <h1 class="omr-title">🎓 Yuva Gyan Mahotsav 2026</h1>
-  <p class="omr-sub">Precision OMR Grader v4.0 &nbsp;·&nbsp; Tiranga Yuva Samiti &nbsp;·&nbsp;
-    Anchor-Square Based Detection</p>
-  <span class="tech-pill">■ Anchor Squares → Interpolated Grid → Adaptive Fill Measurement</span>
-</div>
-""", unsafe_allow_html=True)
-
-# ─── SIDEBAR ──────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### ⚙️ Configuration")
-    pos_mark = st.number_input("✅ Correct (+)", min_value=0.5, max_value=10.0, value=3.0, step=0.5)
-    neg_mark = st.number_input("❌ Wrong (−)", min_value=0.0, max_value=5.0, value=1.0, step=0.5)
-    st.markdown("**Detection**")
-    fill_threshold = st.slider("Fill Threshold", 0.08, 0.55, 0.22, 0.01,
-        help="0.15–0.25 for typical pencil marks. Lower for lighter marks.")
-    st.caption(f"Current: {fill_threshold:.2f}")
-    show_debug = st.checkbox("🔍 Show Debug Log", False)
-    st.divider()
-    st.markdown("### 📋 Answer Key")
-    bulk_key = st.text_area("Paste 60 answers (comma-separated)", placeholder="A,B,C,D,...", height=70)
-    if st.button("Apply Bulk Key", use_container_width=True):
-        parts = [p.strip().upper() for p in bulk_key.split(',')]
-        for i, ans in enumerate(parts[:60]):
-            if ans in ('A','B','C','D',''):
-                st.session_state.answer_key[i+1] = ans
-        st.success("✅ Applied!")
-    st.caption("Or set individually:")
-    options_list = ['', 'A', 'B', 'C', 'D']
-    ck = st.columns(2)
-    for q in range(1, 61):
-        col = ck[0] if q % 2 != 0 else ck[1]
-        with col:
-            st.session_state.answer_key[q] = st.selectbox(
-                f"Q{q}", options_list,
-                index=options_list.index(st.session_state.answer_key.get(q, '')),
-                key=f"key_{q}"
-            )
-
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-st.markdown('<div class="sh"><div class="sdot"></div><h3>Upload & Grade OMR Sheet</h3></div>', unsafe_allow_html=True)
-
-st.markdown("""
-<div class="legend">
-  <span class="chip cg-c">● Correct</span>
-  <span class="chip cg-r">● Wrong</span>
-  <span class="chip cg-g">○ Unattempted</span>
-  <span class="chip cg-a">○ Skipped</span>
-  <span class="chip cg-p">● Multi-Filled</span>
-</div>
-<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:14px;">
-  <p style="color:var(--muted);font-size:0.86rem;line-height:1.65;">
-    <strong style="color:#F97316;">Sheet Format:</strong> 3 columns × 20 rows = 60 questions &nbsp;|&nbsp;
-    Each row: <code style="background:var(--surface2);padding:1px 5px;border-radius:4px;">■ A○ B○ C○ D○ ■</code><br>
-    <strong style="color:#22C55E;">Engine:</strong> Detects solid black ■ squares as anchors → computes exact bubble positions → adaptive fill measurement<br>
-    <strong style="color:#60A5FA;">Best results:</strong> 200–300 DPI scan, PDF format preferred
+  <p class="omr-subtitle">
+    Ultra OMR Auto-Grader v3.0 &nbsp;·&nbsp; Tiranga Yuva Samiti &nbsp;·&nbsp;
+    <span style="color:#22C55E;font-weight:700;">Multi-Strategy AI Detection</span>
   </p>
 </div>
 """, unsafe_allow_html=True)
 
-uploaded = st.file_uploader("Drop OMR sheet here", type=['pdf','png','jpg','jpeg','tiff','bmp'])
+# ─── SIDEBAR ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ Grading Configuration")
+    st.markdown("**Marking Scheme**")
+    pos_mark = st.number_input("✅ Correct (+)", min_value=0.5, max_value=10.0, value=3.0, step=0.5)
+    neg_mark = st.number_input("❌ Wrong (−)", min_value=0.0, max_value=5.0, value=1.0, step=0.5)
+
+    st.markdown("**Detection Sensitivity**")
+    fill_threshold = st.slider(
+        "Fill Threshold", 0.08, 0.55, 0.22, 0.01,
+        help="Lower = picks up lighter pencil marks. Recommended: 0.18–0.30"
+    )
+    st.caption(f"💡 Current: {fill_threshold:.2f} — try 0.15 for light marks, 0.30 for dark marks only")
+
+    show_debug = st.checkbox("🔍 Show Debug Log", value=False)
+
+    st.divider()
+    st.markdown("### 📋 Answer Key")
+    st.caption("Pre-filled randomly for testing. Edit or paste below.")
+
+    bulk_key = st.text_area(
+        "Paste 60 answers (comma-separated)",
+        placeholder="A,B,C,D,A,B,...",
+        height=80
+    )
+    if st.button("Apply Bulk Key", use_container_width=True):
+        parts = [p.strip().upper() for p in bulk_key.split(',')]
+        for i, ans in enumerate(parts[:60]):
+            if ans in ('A', 'B', 'C', 'D', ''):
+                st.session_state.answer_key[i + 1] = ans
+        st.success("✅ Key applied!")
+
+    st.caption("Or set individually:")
+    options = ['', 'A', 'B', 'C', 'D']
+    cols_k = st.columns(2)
+    for q in range(1, 61):
+        col = cols_k[0] if q % 2 != 0 else cols_k[1]
+        with col:
+            st.session_state.answer_key[q] = st.selectbox(
+                f"Q{q}", options,
+                index=options.index(st.session_state.answer_key.get(q, '')),
+                key=f"key_{q}"
+            )
+
+# ─── MAIN ──────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="section-header"><div class="section-dot"></div><h3>Upload & Grade OMR Sheet</h3></div>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="legend">
+  <span class="chip chip-green">● Correct</span>
+  <span class="chip chip-red">● Wrong</span>
+  <span class="chip chip-gray">○ Unattempted</span>
+  <span class="chip chip-amber">○ Skipped</span>
+  <span class="chip chip-purple">● Multi-Filled</span>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="upload-info">
+  <p>
+    <strong style="color:#F97316;">Supported formats:</strong> PDF (scanned), PNG, JPG, TIFF, BMP<br>
+    <strong style="color:#22C55E;">Recommended:</strong> 200–300 DPI scan, straight alignment, clean background<br>
+    <strong style="color:#A855F7;">Ultra Detection:</strong> Hough circles + contour analysis + adaptive thresholding + interpolation
+  </p>
+</div>
+""", unsafe_allow_html=True)
+
+uploaded = st.file_uploader(
+    "Drop OMR sheet here",
+    type=['pdf', 'png', 'jpg', 'jpeg', 'tiff', 'bmp'],
+    help="PDF or image file"
+)
 
 if uploaded:
-    with st.spinner("Loading..."):
-        fbytes = uploaded.read()
+    with st.spinner("Loading file..."):
+        file_bytes = uploaded.read()
         if uploaded.type == 'application/pdf':
-            img_cv = engine.pdf_to_image(fbytes, dpi=300)
+            img_cv = engine.pdf_to_image(file_bytes, dpi=300)
         else:
-            img_cv = engine.pil_to_cv(Image.open(io.BytesIO(fbytes)))
+            pil_img = Image.open(io.BytesIO(file_bytes))
+            img_cv = engine.pil_to_cv(pil_img)
         st.session_state.original_img = img_cv.copy()
-    st.success(f"✅ **{uploaded.name}** — {img_cv.shape[1]}×{img_cv.shape[0]}px")
 
-    col_orig, col_act = st.columns([1, 1])
+    st.success(f"✅ Loaded: **{uploaded.name}** — {img_cv.shape[1]}×{img_cv.shape[0]}px")
+
+    col_orig, col_action = st.columns([1, 1])
     with col_orig:
         st.markdown("**📄 Original Sheet**")
         st.image(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB), use_container_width=True)
-    with col_act:
-        st.markdown("**🔬 Settings**")
+
+    with col_action:
+        st.markdown("**🚀 Grade Settings**")
         st.info(f"""
-**Marking:** +{pos_mark:.1f} correct · −{neg_mark:.1f} wrong  
+**Marking:** +{pos_mark} correct, −{neg_mark} wrong  
 **Fill Threshold:** {fill_threshold:.2f}  
-**Detection:** Anchor-square grid method  
-**Questions:** 60 (3 cols × 20)
+**Questions:** 60 (3 columns × 20)  
+**Engine:** Ultra OMR v3.0
         """)
-        if st.button("🚀 Grade OMR Sheet", use_container_width=True):
-            bar = st.progress(0, text="Finding anchor squares ■...")
-            time.sleep(0.15)
-            bar.progress(25, text="Classifying left/right anchors...")
+        if st.button("🔬 Grade OMR Sheet", use_container_width=True):
+            bar = st.progress(0, text="Deskewing & preprocessing...")
+            time.sleep(0.2)
+            bar.progress(20, text="Running Hough circle detection...")
+            time.sleep(0.2)
+            bar.progress(40, text="Running contour analysis...")
             time.sleep(0.1)
-            bar.progress(45, text="Building precise question grid...")
+            bar.progress(55, text="Merging & deduplicating detections...")
             time.sleep(0.1)
-            bar.progress(60, text="Calibrating bubble positions...")
+            bar.progress(70, text="Building adaptive question grid...")
+
             result, annotated = engine.grade(
-                img_cv, st.session_state.answer_key,
-                pos=pos_mark, neg=neg_mark, fill_thresh=fill_threshold
+                img_cv,
+                st.session_state.answer_key,
+                pos=pos_mark, neg=neg_mark,
+                fill_thresh=fill_threshold
             )
-            bar.progress(85, text="Scoring & annotating...")
+
+            bar.progress(90, text="Scoring & annotating...")
             st.session_state.result = result
             st.session_state.annotated_img = annotated
-            time.sleep(0.15)
-            bar.progress(100, text="Done!")
             time.sleep(0.2)
+            bar.progress(100, text="Complete!")
+            time.sleep(0.3)
             bar.empty()
-            found = result.questions_found
-            if found >= 55:
-                st.success(f"✅ Graded! {found}/60 questions detected.")
-            elif found >= 40:
-                st.warning(f"⚠️ {found}/60 questions detected. Try adjusting fill threshold.")
-            else:
-                st.error(f"⚠️ Only {found}/60 questions detected. Check image quality/DPI.")
+            st.success("✅ Grading complete!")
 
 
-# ─── RESULTS ──────────────────────────────────────────────────────────────────
+# ─── RESULTS ───────────────────────────────────────────────────────────────────
 if st.session_state.result is not None:
     result = st.session_state.result
     st.divider()
-    st.markdown('<div class="sh"><div class="sdot"></div><h3>Results Dashboard</h3></div>', unsafe_allow_html=True)
 
-    max_score = 60 * pos_mark
-    pct = (result.total_score / max_score * 100) if max_score > 0 else 0
-    if pct >= 75:   bcls, bico, btxt = "rb-ex", "🏆", "Outstanding Performance!"
-    elif pct >= 50: bcls, bico, btxt = "rb-gd", "👍", "Good Performance"
-    elif pct >= 35: bcls, bico, btxt = "rb-av", "📚", "Average — Keep Practicing"
-    else:            bcls, bico, btxt = "rb-pr", "⚠️", "Needs Improvement"
-    bar_clr = "#22C55E" if pct>=75 else ("#F59E0B" if pct>=50 else ("#F97316" if pct>=35 else "#EF4444"))
+    st.markdown("""
+    <div class="section-header"><div class="section-dot"></div><h3>Results Dashboard</h3></div>
+    """, unsafe_allow_html=True)
+
+    # Banner
+    total_q = 60
+    max_score = total_q * pos_mark
+    pct = (result.total_score / max_score) * 100 if max_score > 0 else 0
+    if pct >= 75:
+        bcls, btxt, bicon = "banner-excellent", "Outstanding Performance!", "🏆"
+    elif pct >= 50:
+        bcls, btxt, bicon = "banner-good", "Good Performance", "👍"
+    elif pct >= 35:
+        bcls, btxt, bicon = "banner-average", "Average — Keep Practicing", "📚"
+    else:
+        bcls, btxt, bicon = "banner-poor", "Needs Improvement", "⚠️"
+
+    pct_bar_color = "#22C55E" if pct >= 75 else ("#F59E0B" if pct >= 50 else ("#F97316" if pct >= 35 else "#EF4444"))
 
     st.markdown(f"""
-    <div class="rbanner {bcls}">
-      <span style="font-size:2rem;">{bico}</span>
+    <div class="result-banner {bcls}">
+      <span style="font-size:1.8rem;">{bicon}</span>
       <div>
         <div>{btxt}</div>
-        <div style="font-size:0.84rem;font-weight:400;opacity:.8;margin-top:3px;">
-          Score: <strong>{result.total_score:.1f}</strong>/{max_score:.0f} &nbsp;·&nbsp; {pct:.1f}%
-          &nbsp;·&nbsp; Questions found: {result.questions_found}/60
+        <div style="font-size:0.88rem; font-weight:400; opacity:0.8; margin-top:3px;">
+          Score: <strong>{result.total_score:.1f}</strong> / {max_score:.0f} &nbsp;·&nbsp; {pct:.1f}%
         </div>
       </div>
     </div>
-    <div class="score-track"><div class="score-fill" style="width:{min(pct,100):.1f}%;background:linear-gradient(90deg,{bar_clr},{bar_clr}88);"></div></div>
+    <div class="score-progress">
+      <div class="score-track">
+        <div class="score-fill" style="width:{min(pct,100):.1f}%; background:linear-gradient(90deg, {pct_bar_color}, {pct_bar_color}88);"></div>
+      </div>
+    </div>
     """, unsafe_allow_html=True)
 
+    # Stat Cards
     st.markdown(f"""
     <div class="stat-grid">
-      <div class="stat-card c"><div class="sn cg">{result.correct}</div><div class="sl">Correct</div><div class="glow"></div></div>
-      <div class="stat-card w"><div class="sn cr">{result.wrong}</div><div class="sl">Wrong</div><div class="glow"></div></div>
-      <div class="stat-card s"><div class="sn ca">{result.unattempted}</div><div class="sl">Skipped</div><div class="glow"></div></div>
-      <div class="stat-card m"><div class="sn cp">{result.multi}</div><div class="sl">Multi-Mark</div><div class="glow"></div></div>
-      <div class="stat-card sc"><div class="sn co">{result.total_score:.1f}</div><div class="sl">Net Score</div><div class="glow"></div></div>
+      <div class="stat-card correct">
+        <div class="stat-num c-green">{result.correct}</div>
+        <div class="stat-label">Correct</div>
+        <div class="stat-glow"></div>
+      </div>
+      <div class="stat-card wrong">
+        <div class="stat-num c-red">{result.wrong}</div>
+        <div class="stat-label">Wrong</div>
+        <div class="stat-glow"></div>
+      </div>
+      <div class="stat-card skip">
+        <div class="stat-num c-amber">{result.unattempted}</div>
+        <div class="stat-label">Skipped</div>
+        <div class="stat-glow"></div>
+      </div>
+      <div class="stat-card multi">
+        <div class="stat-num c-purple">{result.multi}</div>
+        <div class="stat-label">Multi-Mark</div>
+        <div class="stat-glow"></div>
+      </div>
+      <div class="stat-card score">
+        <div class="stat-num c-orange">{result.total_score:.1f}</div>
+        <div class="stat-label">Final Score</div>
+        <div class="stat-glow"></div>
+      </div>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown("---")
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        st.markdown("**📉 Breakdown**")
+
+    col_a, col_b = st.columns([1, 1])
+
+    with col_a:
+        st.markdown("**📉 Score Breakdown**")
         attempted = result.correct + result.wrong + result.multi
-        acc = (result.correct / attempted * 100) if attempted > 0 else 0
+        accuracy = (result.correct / attempted * 100) if attempted > 0 else 0
+        
         m1, m2 = st.columns(2)
         m1.metric("Positive Score", f"+{result.pos_score:.1f}")
         m2.metric("Negative Score", f"−{result.neg_score:.1f}")
         m3, m4 = st.columns(2)
         m3.metric("Net Score", f"{result.total_score:.1f}")
-        m4.metric("Accuracy", f"{acc:.1f}%")
+        m4.metric("Accuracy", f"{accuracy:.1f}%")
+
         st.markdown(f"""
-        <div style="background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:13px 16px;margin-top:8px;">
-          <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px;">Attempt Stats</div>
-          <div style="display:flex;justify-content:space-between;font-size:0.86rem;padding:3px 0;">
-            <span>Attempted</span><span style="font-weight:700;">{attempted}/60 ({attempted/60*100:.0f}%)</span></div>
-          <div style="display:flex;justify-content:space-between;font-size:0.86rem;padding:3px 0;">
-            <span>Unattempted</span><span style="font-weight:700;">{result.unattempted}</span></div>
-          <div style="display:flex;justify-content:space-between;font-size:0.86rem;padding:3px 0;">
-            <span>Multi-marked</span><span style="font-weight:700;">{result.multi}</span></div>
-          <div style="display:flex;justify-content:space-between;font-size:0.86rem;padding:3px 0;">
-            <span>Questions found</span><span style="font-weight:700;">{result.questions_found}/60</span></div>
+        <div style="background:var(--surface2); border-radius:10px; padding:14px; margin-top:10px; border: 1px solid var(--border);">
+          <div style="font-size:0.78rem; color:var(--muted); text-transform:uppercase; letter-spacing:1px; margin-bottom:8px;">Attempt Analysis</div>
+          <div style="display:flex; justify-content:space-between; font-size:0.88rem; margin:4px 0;">
+            <span>Attempted</span><span style="font-weight:700;">{attempted}/60 ({attempted/60*100:.0f}%)</span>
+          </div>
+          <div style="display:flex; justify-content:space-between; font-size:0.88rem; margin:4px 0;">
+            <span>Unattempted</span><span style="font-weight:700;">{result.unattempted}/60</span>
+          </div>
+          <div style="display:flex; justify-content:space-between; font-size:0.88rem; margin:4px 0;">
+            <span>Multi-marked</span><span style="font-weight:700;">{result.multi}</span>
+          </div>
         </div>
         """, unsafe_allow_html=True)
 
         if show_debug and result.debug_log:
             st.markdown("**🔍 Debug Log**")
-            log_html = "".join(
-                f'<div class="{"ok" if "[OK]" in l else "warn" if "[WARN]" in l else "info"}">{l}</div>'
-                for l in result.debug_log
+            st.markdown(
+                '<div class="debug-panel">' +
+                '<br>'.join(result.debug_log) +
+                '</div>',
+                unsafe_allow_html=True
             )
-            st.markdown(f'<div class="dlog">{log_html}</div>', unsafe_allow_html=True)
 
-    with c2:
-        st.markdown("**🎯 Graded OMR**")
+    with col_b:
+        st.markdown("**🎯 Graded OMR Preview**")
         if st.session_state.annotated_img is not None:
             ann_rgb = cv2.cvtColor(st.session_state.annotated_img, cv2.COLOR_BGR2RGB)
             st.image(ann_rgb, use_container_width=True)
+
+            ann_pil = Image.fromarray(ann_rgb)
             buf = io.BytesIO()
-            Image.fromarray(ann_rgb).save(buf, format='PNG')
-            st.download_button("⬇️ Download Graded Image", buf.getvalue(),
-                               "graded_omr.png", "image/png", use_container_width=True)
+            ann_pil.save(buf, format='PNG')
+            st.download_button(
+                "⬇️ Download Graded Image", buf.getvalue(),
+                file_name="graded_omr.png", mime="image/png",
+                use_container_width=True
+            )
 
     st.divider()
-    st.markdown('<div class="sh"><div class="sdot"></div><h3>Question-wise Report</h3></div>', unsafe_allow_html=True)
 
-    fc1, fc2 = st.columns([2, 1])
-    with fc1:
-        filter_status = st.multiselect("Filter by status",
-            ['correct','wrong','unattempted','multi'],
-            default=['correct','wrong','unattempted','multi'])
-    with fc2:
-        show_fills = st.checkbox("Show fill values", False, help="Raw fill scores for debugging")
+    st.markdown("""
+    <div class="section-header"><div class="section-dot"></div><h3>Question-wise Detailed Report</h3></div>
+    """, unsafe_allow_html=True)
+
+    filter_col1, filter_col2 = st.columns([2, 1])
+    with filter_col1:
+        filter_status = st.multiselect(
+            "Filter by status",
+            ['correct', 'wrong', 'unattempted', 'multi'],
+            default=['correct', 'wrong', 'unattempted', 'multi']
+        )
+    with filter_col2:
+        show_fills = st.checkbox("Show fill values", value=False,
+                                  help="Show raw fill percentages for debugging")
 
     filtered = [b for b in result.bubbles if b.status in filter_status]
+
     rows_html = ""
     for b in filtered:
-        det = ', '.join(b.detected) if b.detected else '—'
-        key = b.answer_key if b.answer_key else '—'
-        sc = f"+{b.score:.0f}" if b.score > 0 else (f"{b.score:.0f}" if b.score != 0 else "0")
-        sc_cls = "cg" if b.score > 0 else ("cr" if b.score < 0 else "ca")
-        bc = {'correct':'bs-c','wrong':'bs-w','unattempted':'bs-s','multi':'bs-m'}.get(b.status,'')
-        bi = {'correct':'✓','wrong':'✗','unattempted':'—','multi':'×'}.get(b.status,'')
-        fv_html = ""
+        detected_str = ', '.join(b.detected) if b.detected else '—'
+        key_str = b.answer_key if b.answer_key else '—'
+        score_str = f"+{b.score:.0f}" if b.score > 0 else (f"{b.score:.0f}" if b.score != 0 else "0")
+        score_color = "c-green" if b.score > 0 else ("c-red" if b.score < 0 else "c-amber")
+        badge_cls = {'correct': 'bs-correct', 'wrong': 'bs-wrong',
+                     'unattempted': 'bs-skip', 'multi': 'bs-multi'}.get(b.status, '')
+        status_icon = {'correct': '✓', 'wrong': '✗', 'unattempted': '—', 'multi': '×'}.get(b.status, '')
+
+        fill_str = ""
         if show_fills and b.fill_values:
-            fv_str = " ".join(f"{k}:{v:.3f}" for k, v in sorted(b.fill_values.items()))
-            fv_html = f"<td style='font-size:.71rem;color:var(--muted);font-family:JetBrains Mono,monospace;'>{fv_str}</td>"
+            fill_str = " ".join([f"{k}:{v:.2f}" for k, v in sorted(b.fill_values.items())])
+
         rows_html += f"""
         <tr>
           <td>Q{b.q_num:02d}</td>
-          <td><span style="color:#60A5FA;font-weight:700;font-family:'JetBrains Mono',monospace;">{det}</span></td>
-          <td><span style="color:#34D399;font-weight:700;font-family:'JetBrains Mono',monospace;">{key}</span></td>
-          <td><span class="bs {bc}">{bi} {b.status.upper()}</span></td>
-          <td class="{sc_cls}" style="font-weight:800;font-family:'JetBrains Mono',monospace;">{sc}</td>
-          {fv_html}
+          <td><span style="color:#60A5FA; font-weight:700; font-family:'JetBrains Mono',monospace;">{detected_str}</span></td>
+          <td><span style="color:#34D399; font-weight:700; font-family:'JetBrains Mono',monospace;">{key_str}</span></td>
+          <td><span class="badge-status {badge_cls}">{status_icon} {b.status.upper()}</span></td>
+          <td class="{score_color}" style="font-weight:800; font-family:'JetBrains Mono',monospace;">{score_str}</td>
+          {"<td style='font-size:0.72rem;color:var(--muted);font-family:JetBrains Mono,monospace;'>" + fill_str + "</td>" if show_fills else ""}
         </tr>"""
 
     extra_th = "<th>Fill Values</th>" if show_fills else ""
-    st.markdown(f"""
-    <div style="max-height:520px;overflow-y:auto;border:1px solid var(--border);border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.4);">
-    <table class="btable">
-      <thead><tr><th>Q#</th><th>Detected</th><th>Answer Key</th><th>Status</th><th>Score</th>{extra_th}</tr></thead>
+    table_html = f"""
+    <div style="max-height:520px; overflow-y:auto; border:1px solid var(--border); border-radius:12px; box-shadow:0 4px 16px rgba(0,0,0,0.3);">
+    <table class="bubble-table">
+      <thead>
+        <tr>
+          <th>Q#</th><th>Detected</th><th>Answer Key</th><th>Status</th><th>Score</th>{extra_th}
+        </tr>
+      </thead>
       <tbody>{rows_html}</tbody>
-    </table></div>
-    """, unsafe_allow_html=True)
+    </table>
+    </div>"""
+    st.markdown(table_html, unsafe_allow_html=True)
 
     st.write("")
-    exp_data = [{'Question': b.q_num, 'Detected': ','.join(b.detected) if b.detected else '',
-                 'Answer Key': b.answer_key, 'Status': b.status, 'Score': b.score,
-                 **{f'Fill_{k}': round(v, 4) for k, v in b.fill_values.items()}}
-                for b in result.bubbles]
-    st.download_button("⬇️ Download Full Results CSV", pd.DataFrame(exp_data).to_csv(index=False),
-                       "omr_results.csv", "text/csv")
+    export_data = [
+        {
+            'Question': b.q_num,
+            'Detected': ', '.join(b.detected) if b.detected else '',
+            'Answer Key': b.answer_key,
+            'Status': b.status,
+            'Score': b.score,
+            **{f'Fill_{k}': round(v, 4) for k, v in b.fill_values.items()}
+        }
+        for b in result.bubbles
+    ]
+    df_export = pd.DataFrame(export_data)
+    st.download_button(
+        "⬇️ Download Full Results CSV",
+        df_export.to_csv(index=False),
+        file_name="omr_results.csv",
+        mime="text/csv"
+    )
 
-# ─── FOOTER ───────────────────────────────────────────────────────────────────
+# ─── FOOTER ────────────────────────────────────────────────────────────────────
 st.markdown("""
-<div style="text-align:center;padding:28px 0 10px;color:var(--muted);font-size:0.78rem;">
-  <div class="tricolor" style="max-width:140px;margin:0 auto 10px;"><div></div><div></div><div></div></div>
-  Yuva Gyan Mahotsav 2026 · Tiranga Yuva Samiti · Precision OMR v4.0<br>
-  <span style="font-size:0.68rem;opacity:.5;">Anchor-Square Detection · Hough Calibration · Adaptive Fill Measurement</span>
+<div style="text-align:center; padding:32px 0 12px; color:var(--muted); font-size:0.8rem; font-weight:500;">
+  <div class="tricolor-bar" style="max-width:160px; margin:0 auto 12px;"><div></div><div></div><div></div></div>
+  Yuva Gyan Mahotsav 2026 · Tiranga Yuva Samiti · Ultra OMR v3.0
+  <br><span style="font-size:0.72rem; opacity:0.6;">Hough Transform · Contour Analysis · Adaptive Thresholding · Grid Interpolation</span>
 </div>
 """, unsafe_allow_html=True)
