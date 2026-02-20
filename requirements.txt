@@ -1,9 +1,7 @@
 streamlit
 opencv-python-headless
 numpy
-imutils
-scipy
 Pillow
-PyMuPDF
 pandas
-
+imutils
+openpyxl
