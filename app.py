@@ -286,29 +286,38 @@ class OMREngine:
 
     def preprocess(self, img: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        # Increased blur slightly to handle scan noise
+        blur = cv2.GaussianBlur(gray, (7, 7), 0)
         _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Add morphological closing to fix disconnected/broken bubble outlines
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
         return thresh
 
     def detect_bubbles(self, img: np.ndarray) -> list:
         thresh = self.preprocess(img)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Changed to RETR_LIST to ensure bubbles inside bounding boxes/tables are found
+        contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         bubbles = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < 80 or area > 3000:
+            # Relaxed area limits to support different resolutions
+            if area < 30 or area > 6000:
                 continue
             peri = cv2.arcLength(cnt, True)
             if peri == 0:
                 continue
             circularity = 4 * np.pi * area / (peri * peri)
-            if circularity < 0.4:
+            # Relaxed circularity to allow slightly oval/warped bubbles
+            if circularity < 0.2:
                 continue
             (x, y, w, h) = cv2.boundingRect(cnt)
             aspect = w / float(h)
-            if not (0.5 < aspect < 2.0):
+            # Relaxed aspect ratio
+            if not (0.4 < aspect < 2.5):
                 continue
-            if w < 6 or h < 6:
+            if w < 5 or h < 5:
                 continue
             cx, cy = x + w // 2, y + h // 2
             bubbles.append({'x': cx, 'y': cy, 'w': w, 'h': h, 'area': area,
@@ -325,9 +334,9 @@ class OMREngine:
             return {}
 
         H, W = img_shape[:2]
-        # Filter out bubbles in header/footer regions
-        margin_top = int(H * 0.17)
-        margin_bot = int(H * 0.88)
+        # Relaxed margins to prevent cutting off top/bottom questions
+        margin_top = int(H * 0.05)
+        margin_bot = int(H * 0.95)
         bubbles = [b for b in bubbles if margin_top < b['y'] < margin_bot]
 
         if not bubbles:
